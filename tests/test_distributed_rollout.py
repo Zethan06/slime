@@ -1220,6 +1220,7 @@ def test_two_ray_nodes_generate_transfer_and_restore(tmp_path, fanout, transport
         "cp_size": 1,
         "vpp_size": 1,
         "microbatch_group_size_per_vp_stage": 1,
+        "dynamic_cp": False,
     }
     node_count = 2
     cluster = Cluster()

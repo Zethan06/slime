@@ -19,12 +19,52 @@ class CPContext:
 
     size: int
     rank: int
-    # None when size == 1: no CP collective is needed.
+    # None for static CP size 1: no CP collective is needed. Dynamic CP always
+    # carries a real group, which the model reads from PackedSeqParams.
     group: ProcessGroup | None
+
+
+# Dynamic CP contexts by size, registered by `init_dynamic_cp_groups`.
+_dynamic_cp_contexts: dict[int, CPContext] = {}
+
+
+def init_dynamic_cp_groups() -> None:
+    """Register the CP group of every size a dynamic CP micro-batch can run on.
+
+    Collective over all ranks; call after ``mpu.initialize_model_parallel(...,
+    hybrid_context_parallel=True)``. A size-k group is the aligned block of k
+    consecutive DP x CP ranks holding this rank, matching the blocks built by
+    ``slime.utils.dp_schedule.build_dynamic_cp_schedule``.
+    """
+    dp_cp_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
+    static_size = mpu.get_context_parallel_world_size()
+
+    groups = {}
+    # Megatron RoPE and TE attention fall back to the static CP group when the
+    # micro-batch's group is None, so size 1 needs its own singleton group.
+    for rank in range(dist.get_world_size()):
+        group = dist.new_group([rank])
+        if rank == dist.get_rank():
+            groups[1] = group
+    size = 2
+    while size <= dp_cp_size:
+        groups[size] = mpu.get_hybrid_data_context_parallel_groups(group_size=size)
+        size *= 2
+    if static_size > 1:
+        # Reuse the static CP communicator, which spans the same aligned block.
+        static_group = mpu.get_context_parallel_group()
+        assert dist.get_process_group_ranks(static_group) == dist.get_process_group_ranks(groups[static_size])
+        groups[static_size] = static_group
+
+    _dynamic_cp_contexts.clear()
+    for size, group in groups.items():
+        _dynamic_cp_contexts[size] = CPContext(size=size, rank=dist.get_rank(group), group=group)
 
 
 def get_cp_context(size: int | None = None) -> CPContext:
     """Return the CP context for ``size`` ranks; ``None`` means the static CP group."""
+    if size is not None and _dynamic_cp_contexts:
+        return _dynamic_cp_contexts[size]
     static_size = mpu.get_context_parallel_world_size()
     if size is None or size == static_size:
         return CPContext(
@@ -32,8 +72,7 @@ def get_cp_context(size: int | None = None) -> CPContext:
             rank=mpu.get_context_parallel_rank(),
             group=mpu.get_context_parallel_group() if static_size > 1 else None,
         )
-    # Dynamic CP will look up the pre-built group of this size here.
-    raise NotImplementedError(f"CP size {size} differs from the static CP size {static_size}.")
+    raise NotImplementedError(f"CP size {size} differs from the static CP size {static_size} without dynamic CP.")
 
 
 def get_sample_cp_contexts(rollout_data: RolloutBatch) -> list[CPContext]:

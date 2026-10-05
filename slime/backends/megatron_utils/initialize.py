@@ -8,6 +8,8 @@ from megatron.core.config import set_experimental_flag
 from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator
 from megatron.training.global_vars import _build_tokenizer, set_args
 
+from .cp_utils import init_dynamic_cp_groups
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,7 +52,18 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
         create_gloo_process_groups=args.enable_gloo_process_groups,
+        # Builds the aligned power-of-2 DP x CP groups dynamic CP micro-batches run on.
+        # The TransformerConfig field of the same name stays off: slime owns the schedule.
+        hybrid_context_parallel=args.dynamic_context_parallel,
     )
+    if args.dynamic_context_parallel:
+        init_dynamic_cp_groups()
+        if args.context_parallel_size == 1:
+            # TE only creates its CP stream when the static CP size is > 1, but dynamic CP
+            # micro-batches still run p2p CP attention.
+            from megatron.core.extensions.transformer_engine import TEDotProductAttention
+
+            TEDotProductAttention.cp_stream = torch.cuda.Stream()
 
 
 def init(args):

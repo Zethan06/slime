@@ -58,6 +58,19 @@ def _validate_dynamic_context_parallel(args):
         "--custom-tis-function-path": args.custom_tis_function_path is not None,
         "--custom-advantage-function-path": args.custom_advantage_function_path is not None,
         "--custom-pg-loss-reducer-function-path": args.custom_pg_loss_reducer_function_path is not None,
+        # Only TE attention switches to the per-micro-batch CP group in PackedSeqParams, and
+        # only for p2p CP; MLA rejects a per-micro-batch CP size.
+        "--transformer-impl other than transformer_engine": args.transformer_impl != "transformer_engine",
+        "--cp-comm-type other than p2p": any(comm_type != "p2p" for comm_type in args.cp_comm_type),
+        "--multi-latent-attention": args.multi_latent_attention,
+        # Custom specs and model providers replace the attention module; the in-tree ones
+        # read the static CP group (hf_attention, qwen3_5_vl, glm5) or ignore CP.
+        "--spec": args.spec is not None,
+        "--custom-model-provider-path": args.custom_model_provider_path is not None,
+        "--num-experts (MoE)": bool(args.num_experts),
+        "--mtp-num-layers": bool(args.mtp_num_layers),
+        "--multimodal-keys": args.multimodal_keys is not None,
+        "critic (--advantage-estimator ppo)": args.use_critic,
     }
     enabled = [name for name, is_set in unsupported.items() if is_set]
     if enabled:
@@ -66,6 +79,13 @@ def _validate_dynamic_context_parallel(args):
         raise ValueError(
             "--dynamic-context-parallel requires --use-dynamic-batch-size and --max-tokens-per-gpu "
             "(the per-rank token budget of the DCP scheduler)."
+        )
+    # Every micro-batch runs on an aligned power-of-2 block of the DP x CP ranks.
+    dp_cp_size = args.data_parallel_size * args.context_parallel_size
+    if dp_cp_size < 2 or dp_cp_size & (dp_cp_size - 1):
+        raise ValueError(
+            f"--dynamic-context-parallel requires data parallel size x context parallel size to be a power "
+            f"of 2 >= 2, got {args.data_parallel_size} x {args.context_parallel_size}."
         )
 
 

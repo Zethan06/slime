@@ -86,6 +86,7 @@ def _run_default_without_straw():
             "cp_size": 1,
             "vpp_size": 1,
             "microbatch_group_size_per_vp_stage": 1,
+            "dynamic_cp": False,
         }
         refs = builder.split_by_dp(
             {

@@ -18,7 +18,7 @@ from slime.observability.rollout_data_utils import (
     validate_rollout_routed_experts_for_replay,
 )
 from slime.utils.data import get_source
-from slime.utils.dp_schedule import build_dp_schedule
+from slime.utils.dp_schedule import build_dp_schedule, build_dynamic_cp_schedule
 from slime.utils.misc import Box, load_function
 from slime.utils.types import Sample
 
@@ -418,7 +418,9 @@ class BatchBuilder:
     def split_by_dp(self, data):
         """Compute the DP/mbs schedule and package each rank's rollout_data
         into a Ray Box. The schedule itself is computed by
-        :func:`build_dp_schedule` so it stays unit-testable without Ray/sglang.
+        :func:`build_dp_schedule` (:func:`build_dynamic_cp_schedule` under dynamic
+        CP, with one payload per DP x CP rank) so it stays unit-testable without
+        Ray/sglang.
 
         Step split is by rollout id (``samples[i].rollout_id``, falling back
         to ``samples[i].index``); each step holds exactly
@@ -427,22 +429,26 @@ class BatchBuilder:
         global_batch_size`` regardless of how many training samples each
         rollout produced.
         """
-        dp_size = self.train_parallel_config["dp_size"]
         total_lengths = [len(t) for t in data["tokens"]]
         data["total_lengths"] = total_lengths
 
-        partitions, micro_batch_indices, num_microbatches, global_batch_sizes = build_dp_schedule(
-            self.args,
-            self.train_parallel_config,
-            total_lengths,
-            global_batch_size=self.args.global_batch_size,
-            rollout_indices=data["rollout_ids"],
-        )
+        schedule_kwargs = dict(global_batch_size=self.args.global_batch_size, rollout_indices=data["rollout_ids"])
+        if self.train_parallel_config["dynamic_cp"]:
+            # One payload per DP x CP rank; `micro_batch_cp_sizes[r][j]` is the CP size of
+            # rank r's j-th micro-batch.
+            partitions, micro_batch_indices, micro_batch_cp_sizes, num_microbatches, global_batch_sizes = (
+                build_dynamic_cp_schedule(self.args, self.train_parallel_config, total_lengths, **schedule_kwargs)
+            )
+        else:
+            partitions, micro_batch_indices, num_microbatches, global_batch_sizes = build_dp_schedule(
+                self.args, self.train_parallel_config, total_lengths, **schedule_kwargs
+            )
+            micro_batch_cp_sizes = None
 
         # Package per-rank rollout_data
         rollout_data_refs = []
         stored_ranks = []
-        for r in range(dp_size):
+        for r in range(len(partitions)):
             partition = partitions[r]
             rollout_data = {"partition": partition}
             for key in [
@@ -478,6 +484,8 @@ class BatchBuilder:
             rollout_data["global_batch_sizes"] = global_batch_sizes
             rollout_data["num_microbatches"] = num_microbatches
             rollout_data["micro_batch_indices"] = micro_batch_indices[r]
+            if micro_batch_cp_sizes is not None:
+                rollout_data["micro_batch_cp_sizes"] = micro_batch_cp_sizes[r]
             tensorize_rollout_data_for_training(rollout_data)
             transport = self.args.rollout_data_transport
             if transport == "straw":
@@ -493,14 +501,14 @@ class BatchBuilder:
                 raise ValueError(f"Unsupported rollout data transport: {transport!r}")
         if transport == "straw":
             if getattr(self, "batch_id", None):
-                self._commit_ready(
-                    stored_ranks,
-                    {
-                        "partitions": partitions,
-                        "micro_batch_indices": micro_batch_indices,
-                        "num_microbatches": num_microbatches,
-                        "global_batch_sizes": global_batch_sizes,
-                    },
-                )
+                schedule = {
+                    "partitions": partitions,
+                    "micro_batch_indices": micro_batch_indices,
+                    "num_microbatches": num_microbatches,
+                    "global_batch_sizes": global_batch_sizes,
+                }
+                if micro_batch_cp_sizes is not None:
+                    schedule["micro_batch_cp_sizes"] = micro_batch_cp_sizes
+                self._commit_ready(stored_ranks, schedule)
             rollout_data_refs = [Box(ray.put(ref)) for ref in stored_ranks]
         return rollout_data_refs

@@ -338,6 +338,17 @@ def process_rollout_data(rollout_data_ref, dp_rank, dp_size):
     if "raw_reward" in rollout_data:
         rollout_data["local_raw_reward"] = [rollout_data["raw_reward"][i] for i in partition]
 
+    # Dynamic CP: each local sample runs with the CP size of its micro-batch.
+    # `micro_batch_indices` tiles the local samples in order.
+    if "micro_batch_cp_sizes" in rollout_data:
+        rollout_data["cp_sizes"] = [
+            cp_size
+            for indices, cp_size in zip(
+                rollout_data["micro_batch_indices"], rollout_data["micro_batch_cp_sizes"], strict=True
+            )
+            for _ in indices
+        ]
+
     return rollout_data
 
 

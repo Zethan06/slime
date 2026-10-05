@@ -120,6 +120,7 @@ class MegatronTrainRayActor(TrainRayActor):
             "cp_size": mpu.get_context_parallel_world_size(),
             "vpp_size": vpp_size,
             "microbatch_group_size_per_vp_stage": microbatch_group_size_per_vp_stage,
+            "dynamic_cp": args.dynamic_context_parallel,
         }
 
         start_rollout_id = loaded_rollout_id + 1
@@ -227,10 +228,12 @@ class MegatronTrainRayActor(TrainRayActor):
     def _get_rollout_data(self, rollout_data_ref: Box) -> RolloutBatch:
         # Fetch data through ray on CPU, not sure if this will be performance bottleneck.
         # Both first pp stage and the last pp stage will receive the data.
+        # Under dynamic CP every DP x CP rank has its own payload.
+        dynamic_cp = self.args.dynamic_context_parallel
         rollout_data = process_rollout_data(
             rollout_data_ref,
-            mpu.get_data_parallel_rank(with_context_parallel=False),
-            mpu.get_data_parallel_world_size(with_context_parallel=False),
+            mpu.get_data_parallel_rank(with_context_parallel=dynamic_cp),
+            mpu.get_data_parallel_world_size(with_context_parallel=dynamic_cp),
         )
         # TODO: this is ugly, move to somewhere else?
         # move tokens to GPU in advance

@@ -165,7 +165,7 @@ def test_dp_transport_keeps_heads_aligned(monkeypatch, transport):
     from slime.data import batch_builder as rollout
 
     mgr = manager(rollout_data_transport=transport, global_batch_size=2)
-    mgr.train_parallel_config = {"dp_size": 2}
+    mgr.train_parallel_config = {"dp_size": 2, "dynamic_cp": False}
     monkeypatch.setattr(rollout, "build_dp_schedule", lambda *a, **kw: ([[1], [0]], [[[0]], [[0]]], [1], [2]))
     captured = []
 
@@ -356,7 +356,7 @@ def test_exact_top_p_transport_and_microbatch(monkeypatch, tmp_path, transport):
         rollout_top_p=0.9, rollout_data_transport=transport, rollout_data_dir=str(tmp_path), global_batch_size=2
     )
     mgr.rollout_id = 0
-    mgr.train_parallel_config = {"dp_size": 2}
+    mgr.train_parallel_config = {"dp_size": 2, "dynamic_cp": False}
     monkeypatch.setattr(rollout, "build_dp_schedule", lambda *a, **kw: ([[1], [0]], [[[0]], [[0]]], [1], [2]))
     monkeypatch.setattr(rollout.ray, "put", lambda data, **kwargs: data)
     samples = []

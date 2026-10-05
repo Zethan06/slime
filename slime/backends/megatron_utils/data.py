@@ -93,12 +93,17 @@ def get_batch(
         cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int, device=accelerator.device()) * cp.size
 
     max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+    # Dynamic CP points TE attention and RoPE at this micro-batch's CP group. Static CP
+    # leaves them unset so the model keeps its own (possibly hierarchical) CP groups.
+    dynamic_cp = batch.get("cp_size") is not None
     packed_seq_params = PackedSeqParams(
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
         qkv_format="thd",
+        local_cp_size=cp.size if dynamic_cp else None,
+        cp_group=cp.group if dynamic_cp else None,
     )
 
     tokens = tokens.unsqueeze(0)
@@ -159,21 +164,25 @@ class DataIterator:
         self,
         rollout_data: RolloutBatch,
         micro_batch_indices: list[list[int]],
+        micro_batch_cp_sizes: list[int] | None = None,
     ) -> None:
         """Initialize an iterator over ``rollout_data``.
 
         Args:
             rollout_data: Dict of per-sample fields for this DP rank.
             micro_batch_indices: List of mbs, each mbs being the local sample indices to select.
+            micro_batch_cp_sizes: Dynamic CP only: the CP size of each mbs.
         """
         self.rollout_data = rollout_data
         self.micro_batch_indices = micro_batch_indices
+        self.micro_batch_cp_sizes = micro_batch_cp_sizes
         self.offset = 0
 
-    def get_next(self, keys: Sequence[str]) -> dict[str, list[object] | None]:
+    def get_next(self, keys: Sequence[str]) -> dict[str, list[object] | int | None]:
         """Return the next micro-batch for the requested keys.
 
-        Returns a dict mapping each key to a list subset (or None if absent).
+        Returns a dict mapping each key to a list subset (or None if absent),
+        plus ``cp_size`` for the mbs under dynamic CP.
         """
         batch = {}
         indices = self.micro_batch_indices[self.offset]
@@ -183,6 +192,8 @@ class DataIterator:
                 batch[key] = None
             else:
                 batch[key] = [vals[i] for i in indices]
+        if self.micro_batch_cp_sizes is not None:
+            batch["cp_size"] = self.micro_batch_cp_sizes[self.offset]
         self.offset += 1
         return batch
 
@@ -196,7 +207,8 @@ def get_data_iterator(rollout_data: RolloutBatch) -> list[DataIterator]:
     """Build one ``DataIterator`` per VPP stage from the pre-computed schedule in ``rollout_data``."""
     vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
     micro_batch_indices = rollout_data["micro_batch_indices"]
-    return [DataIterator(rollout_data, micro_batch_indices) for _ in range(vpp_size)]
+    micro_batch_cp_sizes = rollout_data.get("micro_batch_cp_sizes")
+    return [DataIterator(rollout_data, micro_batch_indices, micro_batch_cp_sizes) for _ in range(vpp_size)]
 
 
 def tensors_to_cpu(tensor_list):
