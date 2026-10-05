@@ -589,6 +589,17 @@ def make_dynamic_cp_args(**overrides):
         custom_pg_loss_reducer_function_path=None,
         use_dynamic_batch_size=True,
         max_tokens_per_gpu=4096,
+        transformer_impl="transformer_engine",
+        cp_comm_type=["p2p"],
+        multi_latent_attention=False,
+        spec=None,
+        custom_model_provider_path=None,
+        num_experts=None,
+        mtp_num_layers=None,
+        multimodal_keys=None,
+        use_critic=False,
+        data_parallel_size=2,
+        context_parallel_size=2,
     )
     values.update(overrides)
     return types.SimpleNamespace(**values)
@@ -614,6 +625,16 @@ def test_dynamic_cp_accepts_supported_config(monkeypatch):
         (dict(custom_tis_function_path="m.f"), "--custom-tis-function-path"),
         (dict(custom_advantage_function_path="m.f"), "--custom-advantage-function-path"),
         (dict(custom_pg_loss_reducer_function_path="m.f"), "--custom-pg-loss-reducer-function-path"),
+        (dict(transformer_impl="local"), "--transformer-impl"),
+        (dict(cp_comm_type=["a2a"]), "--cp-comm-type"),
+        (dict(cp_comm_type=["p2p", "a2a+p2p"]), "--cp-comm-type"),
+        (dict(multi_latent_attention=True), "--multi-latent-attention"),
+        (dict(spec=["slime_plugins.models.qwen3_next", "get_qwen3_next_spec"]), "--spec"),
+        (dict(custom_model_provider_path="m.f"), "--custom-model-provider-path"),
+        (dict(num_experts=8), "--num-experts"),
+        (dict(mtp_num_layers=1), "--mtp-num-layers"),
+        (dict(multimodal_keys={"image": "images"}), "--multimodal-keys"),
+        (dict(use_critic=True), "critic"),
     ],
 )
 def test_dynamic_cp_rejects_unsupported_features(monkeypatch, overrides, flag):
@@ -630,3 +651,24 @@ def test_dynamic_cp_requires_dynamic_batch_size(monkeypatch, overrides):
 
     with pytest.raises(ValueError, match="--max-tokens-per-gpu"):
         module._validate_dynamic_context_parallel(make_dynamic_cp_args(**overrides))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dp_size,cp_size", [(1, 2), (2, 1), (4, 2), (1, 8)])
+def test_dynamic_cp_accepts_power_of_two_dp_cp(monkeypatch, dp_size, cp_size):
+    module = load_arguments_module(monkeypatch)
+
+    module._validate_dynamic_context_parallel(
+        make_dynamic_cp_args(data_parallel_size=dp_size, context_parallel_size=cp_size)
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dp_size,cp_size", [(1, 1), (3, 1), (3, 2), (6, 1)])
+def test_dynamic_cp_rejects_non_power_of_two_dp_cp(monkeypatch, dp_size, cp_size):
+    module = load_arguments_module(monkeypatch)
+
+    with pytest.raises(ValueError, match="power of 2"):
+        module._validate_dynamic_context_parallel(
+            make_dynamic_cp_args(data_parallel_size=dp_size, context_parallel_size=cp_size)
+        )
