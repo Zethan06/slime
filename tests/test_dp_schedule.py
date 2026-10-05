@@ -1,14 +1,15 @@
-"""CPU unit tests for slime.utils.dp_schedule.build_dp_schedule.
+"""CPU unit tests for slime.utils.dp_schedule.build_dp_schedule and build_dynamic_cp_schedule.
 
 The tests assert the invariants documented at the top of dp_schedule.py against
 a range of static / dynamic / VPP / oversize / balance / uneven scenarios.
 """
 
+import random
 from types import SimpleNamespace
 
 import pytest
 
-from slime.utils.dp_schedule import build_dp_schedule
+from slime.utils.dp_schedule import build_dp_schedule, build_dynamic_cp_schedule
 
 
 NUM_GPUS = 0
@@ -320,6 +321,182 @@ def test_rejects_when_fewer_rollouts_than_gbs():
     tp = make_tp(dp_size=1)
     with pytest.raises(AssertionError, match="num_rollouts"):
         build_dp_schedule(args, tp, [3] * 6, global_batch_size=4, rollout_indices=[0, 0, 1, 1, 2, 2])
+
+
+
+def assert_dcp_invariants(
+    partitions,
+    micro_batch_indices,
+    micro_batch_cp_sizes,
+    num_microbatches,
+    *,
+    world_size,
+    expected_global_sample_indices,
+    total_lengths,
+    max_tokens_per_gpu,
+):
+    """Check the DCP round invariants documented on build_dynamic_cp_schedule."""
+    num_rounds = sum(num_microbatches)
+    for r in range(world_size):
+        # Same round count per rank.
+        assert len(micro_batch_indices[r]) == num_rounds, f"rank {r}: round count mismatch"
+        assert len(micro_batch_cp_sizes[r]) == num_rounds, f"rank {r}: cp size count mismatch"
+        flat = [i for mbs in micro_batch_indices[r] for i in mbs]
+        assert flat == list(range(len(partitions[r]))), f"rank {r}: micro_batch_indices don't tile [0, n)"
+
+    scheduled: list[int] = []
+    for j in range(num_rounds):
+        rank_samples = [[partitions[r][i] for i in micro_batch_indices[r][j]] for r in range(world_size)]
+        rank = 0
+        while rank < world_size:
+            cp_size = micro_batch_cp_sizes[rank][j]
+            # Aligned, contiguous power-of-2 block covering [rank, rank + cp_size).
+            assert cp_size >= 1 and cp_size & (cp_size - 1) == 0, f"round {j}: cp_size {cp_size} not a power of 2"
+            assert rank % cp_size == 0, f"round {j}: block at {rank} not aligned to {cp_size}"
+            assert rank + cp_size <= world_size, f"round {j}: block at {rank} overflows world_size"
+            block = range(rank, rank + cp_size)
+            assert all(micro_batch_cp_sizes[b][j] == cp_size for b in block), f"round {j}: cp size differs in block"
+            assert all(rank_samples[b] == rank_samples[rank] for b in block), f"round {j}: samples differ in block"
+            assert rank_samples[rank], f"round {j}: block at {rank} is idle"
+            unit_tokens = sum(total_lengths[i] for i in rank_samples[rank])
+            assert unit_tokens <= cp_size * max_tokens_per_gpu, f"round {j}: {unit_tokens} tokens > cp {cp_size} cap"
+            scheduled.extend(rank_samples[rank])
+            rank += cp_size
+
+    # Every kept sample scheduled exactly once (each block counted once).
+    assert sorted(scheduled) == sorted(expected_global_sample_indices), "scheduled sample set mismatch"
+
+
+def run_dcp(total_lengths, *, dp_size, cp_size, max_tokens_per_gpu, global_batch_size=None):
+    rollout_indices = list(range(len(total_lengths)))
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=max_tokens_per_gpu)
+    tp = make_tp(dp_size=dp_size, cp_size=cp_size)
+    partitions, mbi, cp_sizes, nmb, gbs_per_step = build_dynamic_cp_schedule(
+        args,
+        tp,
+        total_lengths,
+        global_batch_size=global_batch_size or len(total_lengths),
+        rollout_indices=rollout_indices,
+    )
+    assert_dcp_invariants(
+        partitions,
+        mbi,
+        cp_sizes,
+        nmb,
+        world_size=dp_size * cp_size,
+        expected_global_sample_indices=range(len(total_lengths)),
+        total_lengths=total_lengths,
+        max_tokens_per_gpu=max_tokens_per_gpu,
+    )
+    return partitions, mbi, cp_sizes, nmb, gbs_per_step
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dp_size,cp_size", [(1, 2), (2, 2), (4, 2)])
+def test_dcp_all_short(dp_size, cp_size):
+    """Short samples run on single ranks; rounds stay fully covered."""
+    world_size = dp_size * cp_size
+    _, _, cp_sizes, nmb, gbs_per_step = run_dcp(
+        [3] * (4 * world_size), dp_size=dp_size, cp_size=cp_size, max_tokens_per_gpu=10
+    )
+    assert gbs_per_step == [4 * world_size]
+    # 3 samples fit per rank: the first round is all single-rank blocks, the leftover
+    # units fill a second round.
+    assert nmb == [2]
+    assert all(cp_sizes[r][0] == 1 for r in range(world_size))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dp_size,cp_size", [(1, 2), (2, 2), (4, 2)])
+def test_dcp_all_long(dp_size, cp_size):
+    """Samples needing 2 ranks each run on aligned pairs."""
+    world_size = dp_size * cp_size
+    _, _, cp_sizes, nmb, _ = run_dcp([15] * world_size, dp_size=dp_size, cp_size=cp_size, max_tokens_per_gpu=10)
+    assert nmb == [2]
+    assert all(k == 2 for r in range(world_size) for k in cp_sizes[r])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dp_size,cp_size", [(1, 2), (2, 2), (4, 2)])
+def test_dcp_mixed_lengths(dp_size, cp_size):
+    total_lengths = [1, 35, 8, 12, 4, 25, 9, 2, 17, 3, 6, 40, 5, 11, 7, 1]
+    world_size = dp_size * cp_size
+    total_lengths = [min(length, world_size * 10) for length in total_lengths]
+    run_dcp(total_lengths, dp_size=dp_size, cp_size=cp_size, max_tokens_per_gpu=10)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dp_size,cp_size", [(1, 2), (2, 2), (4, 2)])
+def test_dcp_single_sample_needs_full_world(dp_size, cp_size):
+    world_size = dp_size * cp_size
+    _, _, cp_sizes, nmb, _ = run_dcp([world_size * 10], dp_size=dp_size, cp_size=cp_size, max_tokens_per_gpu=10)
+    assert nmb == [1]
+    assert all(cp_sizes[r] == [world_size] for r in range(world_size))
+
+
+@pytest.mark.unit
+def test_dcp_single_short_sample_grows_to_full_world():
+    """A lone short sample is grown to cover every rank rather than leaving ranks idle."""
+    partitions, _, cp_sizes, nmb, _ = run_dcp([3], dp_size=4, cp_size=1, max_tokens_per_gpu=10)
+    assert nmb == [1]
+    assert partitions == [[0]] * 4
+    assert all(cp_sizes[r] == [4] for r in range(4))
+
+
+@pytest.mark.unit
+def test_dcp_fills_idle_block_by_merging_buddy():
+    """W=4, one k=2 sample at ranks [0, 2) and one k=1 sample at rank 2: rank 3 is free,
+    so the rank-2 unit grows to k=2 at [2, 4)."""
+    _, _, cp_sizes, nmb, _ = run_dcp([15, 3], dp_size=2, cp_size=2, max_tokens_per_gpu=10)
+    assert nmb == [1]
+    assert [cp_sizes[r][0] for r in range(4)] == [2, 2, 2, 2]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dp_size,cp_size", [(1, 2), (2, 2), (4, 2)])
+def test_dcp_multi_step(dp_size, cp_size):
+    """Rounds are per step; each step independently covers all ranks."""
+    world_size = dp_size * cp_size
+    total_lengths = [3, 15, 7, 2, 9, 4, 1, 12, 6, 8, 5, 11]
+    partitions, mbi, cp_sizes, nmb, gbs_per_step = run_dcp(
+        total_lengths, dp_size=dp_size, cp_size=cp_size, max_tokens_per_gpu=10, global_batch_size=4
+    )
+    assert gbs_per_step == [4, 4, 4]
+    assert len(nmb) == 3
+    # Each step's rounds only hold that step's samples.
+    cursor = 0
+    for step_i, n in enumerate(nmb):
+        step_samples = {
+            partitions[r][i] for r in range(world_size) for mbs in mbi[r][cursor : cursor + n] for i in mbs
+        }
+        assert step_samples == set(range(step_i * 4, (step_i + 1) * 4))
+        cursor += n
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dp_size,cp_size", [(1, 2), (2, 2), (4, 2), (8, 4)])
+def test_dcp_random_lengths(dp_size, cp_size):
+    world_size = dp_size * cp_size
+    rng = random.Random(world_size)
+    for _ in range(20):
+        total_lengths = [rng.randint(1, world_size * 10) for _ in range(rng.randint(1, 40))]
+        run_dcp(total_lengths, dp_size=dp_size, cp_size=cp_size, max_tokens_per_gpu=10)
+
+
+@pytest.mark.unit
+def test_dcp_rejects_too_long_sample():
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=10)
+    tp = make_tp(dp_size=2, cp_size=2)
+    with pytest.raises(ValueError, match="exceeding world_size"):
+        build_dynamic_cp_schedule(args, tp, [3, 41], global_batch_size=2, rollout_indices=[0, 1])
+
+
+@pytest.mark.unit
+def test_dcp_rejects_non_power_of_two_world():
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=10)
+    tp = make_tp(dp_size=3, cp_size=1)
+    with pytest.raises(AssertionError, match="power of 2"):
+        build_dynamic_cp_schedule(args, tp, [3, 4, 5], global_batch_size=3, rollout_indices=[0, 1, 2])
 
 
 if __name__ == "__main__":
