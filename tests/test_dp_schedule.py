@@ -323,7 +323,6 @@ def test_rejects_when_fewer_rollouts_than_gbs():
         build_dp_schedule(args, tp, [3] * 6, global_batch_size=4, rollout_indices=[0, 0, 1, 1, 2, 2])
 
 
-
 def assert_dcp_invariants(
     partitions,
     micro_batch_indices,
@@ -444,12 +443,23 @@ def test_dcp_single_short_sample_grows_to_full_world():
 
 
 @pytest.mark.unit
-def test_dcp_fills_idle_block_by_merging_buddy():
+def test_dcp_fills_idle_rank_by_growing_smallest_group():
     """W=4, one k=2 sample at ranks [0, 2) and one k=1 sample at rank 2: rank 3 is free,
-    so the rank-2 unit grows to k=2 at [2, 4)."""
+    so the k=1 group grows to k=2 at [2, 4)."""
     _, _, cp_sizes, nmb, _ = run_dcp([15, 3], dp_size=2, cp_size=2, max_tokens_per_gpu=10)
     assert nmb == [1]
     assert [cp_sizes[r][0] for r in range(4)] == [2, 2, 2, 2]
+
+
+@pytest.mark.unit
+def test_dcp_packs_short_sample_into_long_sample_group():
+    """W=4, a 3000-token sample needs k=4 and leaves 250 tokens of spare capacity per
+    rank; a 1000-token sample (1000 / 4 = 250 per rank) joins that group instead of
+    opening a second round."""
+    partitions, _, cp_sizes, nmb, _ = run_dcp([3000, 1000], dp_size=2, cp_size=2, max_tokens_per_gpu=1000)
+    assert nmb == [1]
+    assert partitions == [[0, 1]] * 4
+    assert all(cp_sizes[r] == [4] for r in range(4))
 
 
 @pytest.mark.unit
