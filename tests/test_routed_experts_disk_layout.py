@@ -7,7 +7,7 @@ from straw import SharedFilesystemStore
 from straw.tensor import TensorRef, publish_tensors
 
 from slime.backends.megatron_utils import cp_utils
-from slime.backends.megatron_utils.cp_utils import prepare_routed_experts_for_routing_replay
+from slime.backends.megatron_utils.cp_utils import CPContext, prepare_routed_experts_for_routing_replay
 from slime.utils.routed_experts import RoutedExpertsMicrobatch, RoutedExpertsMicrobatchPrefetcher
 
 NUM_GPUS = 0
@@ -109,6 +109,7 @@ def test_selective_reads_match_complete_reference(
     monkeypatch.setattr(TensorRef, "load", lambda *a, **k: pytest.fail("full straw tensor load"))
     mpu = cp_utils.mpu
     monkeypatch.setattr(mpu, "get_context_parallel_world_size", lambda: cp_size)
+    monkeypatch.setattr(mpu, "get_context_parallel_group", lambda: None, raising=False)
     monkeypatch.setattr(mpu, "get_tensor_model_parallel_world_size", lambda: 2, raising=False)
     for cp_rank in range(cp_size):
         monkeypatch.setattr(mpu, "get_context_parallel_rank", lambda rank=cp_rank: rank)
@@ -136,6 +137,11 @@ def test_selective_reads_match_complete_reference(
                 **kwargs,
             )
             assert torch.equal(actual, expected)
+            if not allgather_cp:
+                # The micro-batch CP context passed explicitly lays out the same rows.
+                cp = CPContext(size=cp_size, rank=cp_rank, group=None)
+                explicit = prepare_routed_experts_for_routing_replay(refs, tokens, cp=cp, **kwargs)
+                assert torch.equal(explicit, expected)
 
 
 @pytest.mark.parametrize("resident_type", ["tensor", "numpy", "list"])

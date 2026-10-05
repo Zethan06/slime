@@ -125,6 +125,8 @@ def test_on_policy_correction_zero_and_tiny_tails_finite():
 
 
 def make_batch():
+    from slime.backends.megatron_utils.cp_utils import get_cp_context
+
     torch.manual_seed(8)
     total, response = [8, 8], [3, 2]
     q = [torch.randn(r, 12).log_softmax(-1) for r in response]
@@ -142,6 +144,8 @@ def make_batch():
             x.gather(-1, t[-r:, None]).squeeze(-1) for x, t, r in zip(q, tokens, response, strict=True)
         ],
         advantages=[torch.tensor([1.0, -3.0, -1.0]), torch.tensor([2.0, -0.5])],
+        # The micro-batch CP context `get_batch` attaches.
+        cp=get_cp_context(),
     )
 
 

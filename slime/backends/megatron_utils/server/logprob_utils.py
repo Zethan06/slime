@@ -8,7 +8,12 @@ import torch.distributed as dist
 from megatron.core import mpu
 
 from slime.backends.megatron_utils.actor import MegatronTrainRayActor
-from slime.backends.megatron_utils.cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp
+from slime.backends.megatron_utils.cp_utils import (
+    CPContext,
+    all_gather_with_cp,
+    get_logits_and_tokens_offset_with_cp,
+    get_sample_cp_contexts,
+)
 from slime.backends.megatron_utils.data import get_data_iterator
 from slime.backends.megatron_utils.loss import get_log_probs_and_entropy, get_responses
 from slime.backends.megatron_utils.model import forward_only
@@ -250,19 +255,17 @@ def _merge_tensors_with_cp(
     tensors: list[torch.Tensor] | None,
     total_lengths: list[int],
     response_lengths: list[int],
-    args,
+    cps: list[CPContext],
 ) -> list[torch.Tensor] | None:
     if not tensors:
         return tensors
 
-    cp_size = mpu.get_context_parallel_world_size()
-    if cp_size == 1:
-        return tensors
-
-    merged = []
-    for tensor, total_length, response_length in zip(tensors, total_lengths, response_lengths, strict=False):
-        merged.append(all_gather_with_cp(tensor, total_length, response_length))
-    return merged
+    return [
+        all_gather_with_cp(tensor, total_length, response_length, cp=cp)
+        for tensor, total_length, response_length, cp in zip(
+            tensors, total_lengths, response_lengths, cps, strict=False
+        )
+    ]
 
 
 def _slice_response_rows_for_current_cp_rank(
@@ -273,9 +276,9 @@ def _slice_response_rows_for_current_cp_rank(
     args,
     total_lengths: list[int],
     response_lengths: list[int],
+    cp: CPContext,
 ) -> torch.Tensor:
-    cp_size = mpu.get_context_parallel_world_size()
-    if cp_size == 1:
+    if cp.size == 1:
         return rows
 
     total_length = total_lengths[sample_idx]
@@ -294,7 +297,7 @@ def _slice_response_rows_for_current_cp_rank(
             return rows[:0]
         return rows[start - logit_global_start : end - logit_global_start]
 
-    _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(total_length, response_length)
+    _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(total_length, response_length, cp=cp)
     rows_0 = rows[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
     rows_1 = rows[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
     return torch.cat([rows_0, rows_1], dim=0)
@@ -360,6 +363,7 @@ def _get_log_probs_and_optional_samples(
     non_loss_data: bool = True,
     sample_n: int = 0,
     label_token_ids: list[torch.Tensor] | None = None,
+    cp: CPContext,
 ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
     _, outputs = get_log_probs_and_entropy(
         logits,
@@ -369,6 +373,7 @@ def _get_log_probs_and_optional_samples(
         response_lengths=response_lengths,
         with_entropy=with_entropy,
         non_loss_data=non_loss_data,
+        cp=cp,
     )
     logits_local_len = logits.size(1)
 
@@ -385,6 +390,7 @@ def _get_log_probs_and_optional_samples(
                     unconcat_tokens=unconcat_tokens,
                     total_lengths=total_lengths,
                     response_lengths=response_lengths,
+                    cp=cp,
                 ),
                 label_token_ids,
                 strict=True,
@@ -397,6 +403,7 @@ def _get_log_probs_and_optional_samples(
                 args=args,
                 total_lengths=total_lengths,
                 response_lengths=response_lengths,
+                cp=cp,
             )
             label_token_log_probs.append(
                 get_label_token_log_probs_from_vocab_parallel_logits(
@@ -418,6 +425,7 @@ def _get_log_probs_and_optional_samples(
             unconcat_tokens=unconcat_tokens,
             total_lengths=total_lengths,
             response_lengths=response_lengths,
+            cp=cp,
         ):
             if logits_chunk.size(0) == 0:
                 sampled_token_ids.append(torch.empty((0, sample_n), dtype=torch.long, device=logits_chunk.device))
@@ -506,11 +514,12 @@ class TeacherLogpRayActor(MegatronTrainRayActor):
         sampled_log_probs = forward_outputs.get("sampled_log_probs", None)
         label_token_log_probs = forward_outputs.get("label_token_log_probs", None)
         if mpu.is_pipeline_last_stage():
+            cps = get_sample_cp_contexts(rollout_data)
             log_probs = _merge_tensors_with_cp(
                 log_probs,
                 rollout_data["total_lengths"],
                 rollout_data["response_lengths"],
-                self.args,
+                cps,
             )
             if sampled_log_probs is not None:
                 if not self.args.allgather_cp:
@@ -518,7 +527,7 @@ class TeacherLogpRayActor(MegatronTrainRayActor):
                         sampled_log_probs,
                         rollout_data["total_lengths"],
                         rollout_data["response_lengths"],
-                        self.args,
+                        cps,
                     )
             if sampled_token_ids is not None:
                 sampled_token_ids = [x.to(torch.float32) for x in sampled_token_ids]
@@ -527,7 +536,7 @@ class TeacherLogpRayActor(MegatronTrainRayActor):
                         sampled_token_ids,
                         rollout_data["total_lengths"],
                         rollout_data["response_lengths"],
-                        self.args,
+                        cps,
                     )
             if label_token_log_probs is not None:
                 if not self.args.allgather_cp:
@@ -535,7 +544,7 @@ class TeacherLogpRayActor(MegatronTrainRayActor):
                         label_token_log_probs,
                         rollout_data["total_lengths"],
                         rollout_data["response_lengths"],
-                        self.args,
+                        cps,
                     )
             if mpu.get_context_parallel_rank() == 0 and mpu.get_tensor_model_parallel_rank() == 0:
                 log_prob = log_probs[0].tolist()

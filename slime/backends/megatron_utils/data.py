@@ -8,7 +8,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from slime.utils import accelerator
 from slime.utils.types import RolloutBatch
 
-from .cp_utils import slice_with_cp
+from .cp_utils import get_cp_context, slice_with_cp
 
 
 def get_batch(
@@ -35,6 +35,7 @@ def get_batch(
     - "tokens": torch.LongTensor of shape [1, T_padded] on the current CUDA device
     - "unconcat_tokens": list[torch.LongTensor] for the micro-batch before CP slicing/concat
     - "packed_seq_params": PackedSeqParams with T-H-D settings (cu_seqlens on CUDA, dtype=int)
+    - "cp": the CPContext this micro-batch is split over
     Plus any other requested keys forwarded from the iterator.
     """
 
@@ -49,10 +50,12 @@ def get_batch(
     # for cp, we need all tokens to calculate logprob
     batch["unconcat_tokens"] = tokens
 
-    cp_size = mpu.get_context_parallel_world_size()
-    cp_rank = mpu.get_context_parallel_rank()
+    cp = get_cp_context(batch.get("cp_size"))
+    batch["cp"] = cp
 
     if allgather_cp:
+        cp_size = mpu.get_context_parallel_world_size()
+        cp_rank = mpu.get_context_parallel_rank()
         # DSA mode: concatenate all sequences first, then slice once with CP.
         # We also pad the *global* concatenated stream to make per-rank chunks equal.
         cu_seqlens_list: list[int] = [0]
@@ -72,7 +75,7 @@ def get_batch(
         cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int, device=accelerator.current_device())
         tokens = tokens.chunk(cp_size, dim=0)[cp_rank]
     else:
-        tokens = [slice_with_cp(t, pad_token_id) for t in tokens]
+        tokens = [slice_with_cp(t, pad_token_id, cp=cp) for t in tokens]
 
         cu_seqlens = [0]
         for t in tokens:
@@ -87,7 +90,7 @@ def get_batch(
             cu_seqlens.append(cu_seqlens[-1] + pad)
 
         # thd requires the cu_seqlens to be of the origin length
-        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int, device=accelerator.device()) * cp_size
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int, device=accelerator.device()) * cp.size
 
     max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
     packed_seq_params = PackedSeqParams(
@@ -117,7 +120,7 @@ def get_batch(
         if allgather_cp:
             loss_masks.append(loss_mask)
             continue
-        loss_mask = slice_with_cp(loss_mask, 0)
+        loss_mask = slice_with_cp(loss_mask, 0, cp=cp)
         loss_masks.append(loss_mask)
 
     if allgather_cp:

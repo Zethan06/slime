@@ -1,24 +1,61 @@
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from megatron.core import mpu
+from torch.distributed import ProcessGroup
 
 from slime.data.tensor import TensorRef
+from slime.utils.types import RolloutBatch
 
 _RoutedExpertsInput = torch.Tensor | TensorRef
+
+
+@dataclass(frozen=True)
+class CPContext:
+    """The context-parallel group a sample is split over (zigzag layout)."""
+
+    size: int
+    rank: int
+    # None when size == 1: no CP collective is needed.
+    group: ProcessGroup | None
+
+
+def get_cp_context(size: int | None = None) -> CPContext:
+    """Return the CP context for ``size`` ranks; ``None`` means the static CP group."""
+    static_size = mpu.get_context_parallel_world_size()
+    if size is None or size == static_size:
+        return CPContext(
+            size=static_size,
+            rank=mpu.get_context_parallel_rank(),
+            group=mpu.get_context_parallel_group() if static_size > 1 else None,
+        )
+    # Dynamic CP will look up the pre-built group of this size here.
+    raise NotImplementedError(f"CP size {size} differs from the static CP size {static_size}.")
+
+
+def get_sample_cp_contexts(rollout_data: RolloutBatch) -> list[CPContext]:
+    """Return the CP context of every sample in ``rollout_data``."""
+    if "cp_sizes" in rollout_data:
+        return [get_cp_context(size) for size in rollout_data["cp_sizes"]]
+    # `response_lengths` is always rank-local; `total_lengths` arrives whole
+    # and is only partitioned in `process_rollout_data`.
+    return [get_cp_context()] * len(rollout_data["response_lengths"])
 
 
 def get_logits_and_tokens_offset_with_cp(
     total_length: int,
     response_length: int,
+    *,
+    cp: CPContext | None = None,
 ):
     """
     All offsets start from the begining of the prompt.
     """
-    cp_rank = mpu.get_context_parallel_rank()
-    cp_size = mpu.get_context_parallel_world_size()
+    cp = cp or get_cp_context()
+    cp_rank, cp_size = cp.rank, cp.size
     assert cp_size > 1
 
     prompt_length = total_length - response_length
@@ -57,6 +94,8 @@ def get_sum_of_sample_mean(
     loss_masks: list[torch.Tensor],
     sample_denoms: list[torch.Tensor] | torch.Tensor | None = None,
     calculate_per_token_loss: bool = False,
+    *,
+    cps: Sequence[CPContext] | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """
     Calculate correct sample mean for CP.
@@ -70,87 +109,75 @@ def get_sum_of_sample_mean(
     step level rather than per-mb is required — otherwise a rollout whose
     samples land in different micro-batches would get a partial denominator
     on each side.
+
+    ``cps`` holds each sample's CP context; ``None`` means the static CP group.
     """
     if sample_denoms is None:
         sample_denoms = [m.sum() for m in loss_masks]
+    if cps is None:
+        cps = [get_cp_context()] * len(total_lengths)
 
-    cp_size = mpu.get_context_parallel_world_size()
-    if cp_size == 1:
+    cp_chunk_lengths: list[int] = []
+    chunked_loss_masks: list[torch.Tensor] = []
+    for total_length, response_length, loss_mask, cp in zip(
+        total_lengths, response_lengths, loss_masks, cps, strict=False
+    ):
+        if cp.size == 1:
+            cp_chunk_lengths.append(response_length)
+            chunked_loss_masks.append(loss_mask)
+            continue
+        prompt_length = total_length - response_length
+        _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(total_length, response_length, cp=cp)
+        loss_mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
+        loss_mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
+        chunked_loss_mask = torch.cat([loss_mask_0, loss_mask_1], dim=0)
+        chunked_loss_masks.append(chunked_loss_mask)
+        cp_chunk_lengths.append(chunked_loss_mask.size(0))
 
-        def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
-            return sum(
-                [
-                    (x_i * loss_mask_i).sum() / torch.clamp_min(denom, 1)
-                    for x_i, loss_mask_i, denom in zip(
-                        x.split(response_lengths, dim=0),
-                        loss_masks,
-                        sample_denoms,
-                        strict=False,
-                    )
-                ]
-            )
+    def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
+        return sum(
+            [
+                (x_i * chunked_loss_mask).sum() / torch.clamp_min(denom, 1)
+                for x_i, chunked_loss_mask, denom in zip(
+                    x.split(cp_chunk_lengths, dim=0),
+                    chunked_loss_masks,
+                    sample_denoms,
+                    strict=False,
+                )
+            ]
+        )
 
-        def sum_of_token(x: torch.Tensor) -> torch.Tensor:
-            return sum(
-                [
-                    (x_i * loss_mask_i).sum()
-                    for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=False)
-                ]
-            )
-
-    else:
-        cp_chunk_lengths: list[int] = []
-        chunked_loss_masks: list[torch.Tensor] = []
-
-        for total_length, response_length, loss_mask in zip(total_lengths, response_lengths, loss_masks, strict=False):
-            prompt_length = total_length - response_length
-            _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(total_length, response_length)
-            loss_mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
-            loss_mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
-            chunked_loss_mask = torch.cat([loss_mask_0, loss_mask_1], dim=0)
-            chunked_loss_masks.append(chunked_loss_mask)
-            cp_chunk_lengths.append(chunked_loss_mask.size(0))
-
-        def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
-            return sum(
-                [
-                    (x_i * chunked_loss_mask).sum() / torch.clamp_min(denom, 1)
-                    for x_i, chunked_loss_mask, denom in zip(
-                        x.split(cp_chunk_lengths, dim=0),
-                        chunked_loss_masks,
-                        sample_denoms,
-                        strict=False,
-                    )
-                ]
-            )
-
-        def sum_of_token(x: torch.Tensor) -> torch.Tensor:
-            return sum(
-                [
-                    (x_i * chunked_loss_mask).sum()
-                    for x_i, chunked_loss_mask in zip(
-                        x.split(cp_chunk_lengths, dim=0),
-                        chunked_loss_masks,
-                        strict=False,
-                    )
-                ]
-            )
+    def sum_of_token(x: torch.Tensor) -> torch.Tensor:
+        return sum(
+            [
+                (x_i * chunked_loss_mask).sum()
+                for x_i, chunked_loss_mask in zip(
+                    x.split(cp_chunk_lengths, dim=0),
+                    chunked_loss_masks,
+                    strict=False,
+                )
+            ]
+        )
 
     return sum_of_sample_mean if not calculate_per_token_loss else sum_of_token
 
 
-def all_gather_with_cp(tensor: torch.Tensor, total_length: int, response_length: int) -> torch.Tensor:
+def all_gather_with_cp(
+    tensor: torch.Tensor,
+    total_length: int,
+    response_length: int,
+    *,
+    cp: CPContext | None = None,
+) -> torch.Tensor:
     """
     Gather tensors across all ranks in the context parallel group.
     The first dimension of the output tensor will be the `response_length`.
     """
-    cp_group = mpu.get_context_parallel_group()
-    cp_size = mpu.get_context_parallel_world_size()
-
-    if cp_size == 1:
+    cp = cp or get_cp_context()
+    if cp.size == 1:
         return tensor
 
-    _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(total_length, response_length)
+    _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(total_length, response_length, cp=cp)
 
     prompt_length = total_length - response_length
 
@@ -187,16 +214,18 @@ def all_gather_with_cp(tensor: torch.Tensor, total_length: int, response_length:
         full_tensor = torch.cat([left, chunk_0, mid, chunk_1, right], dim=0)
 
     assert full_tensor.shape[0] == response_length, f"Expected {response_length}, got {full_tensor.shape}"
-    full_tensor = dist.nn.all_reduce(full_tensor, group=cp_group)
+    full_tensor = dist.nn.all_reduce(full_tensor, group=cp.group)
     return full_tensor
 
 
 def slice_with_cp(
     tokens: torch.Tensor,
     pad_value: tuple[int, float, Callable],
+    *,
+    cp: CPContext | None = None,
 ) -> torch.Tensor:
-    cp_rank = mpu.get_context_parallel_rank()
-    cp_size = mpu.get_context_parallel_world_size()
+    cp = cp or get_cp_context()
+    cp_rank, cp_size = cp.rank, cp.size
 
     def pad_tokens(tokens, pad):
         if isinstance(pad_value, Callable):
@@ -228,19 +257,20 @@ def slice_log_prob_with_cp(
     log_prob: list[float] | torch.Tensor,
     total_length: int,
     response_length: int,
+    *,
+    cp: CPContext | None = None,
 ) -> list[float] | torch.Tensor:
     assert len(log_prob) == response_length, (
         f"log_prob length mismatch: len(log_prob)={len(log_prob)}, "
         f"response_length={response_length}, total_length={total_length}"
     )
 
-    cp_size = mpu.get_context_parallel_world_size()
-
-    if cp_size == 1:
+    cp = cp or get_cp_context()
+    if cp.size == 1:
         return log_prob
 
     prompt_length = total_length - response_length
-    _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(total_length, response_length)
+    _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(total_length, response_length, cp=cp)
 
     chunk_1 = log_prob[logits_offset[0][0] - (prompt_length - 1) : logits_offset[0][1] - (prompt_length - 1)]
     chunk_2 = log_prob[logits_offset[1][0] - (prompt_length - 1) : logits_offset[1][1] - (prompt_length - 1)]
@@ -463,8 +493,13 @@ def prepare_routed_experts_for_routing_replay(
     data_pad_size_multiplier: int,
     sequence_parallel: bool,
     allgather_cp: bool,
+    cp: CPContext | None = None,
 ) -> torch.Tensor:
-    """Align routes with training tokens, reading only this rank's lazy rows."""
+    """Align routes with training tokens, reading only this rank's lazy rows.
+
+    ``cp`` is the micro-batch's zigzag CP context (default: the static CP
+    group); allgather-CP always uses the static CP group.
+    """
     assert len(rollout_routed_experts) == len(tokens)
     assert len(rollout_routed_experts) > 0
     _, num_layers, topk = rollout_routed_experts[0].shape
@@ -476,11 +511,11 @@ def prepare_routed_experts_for_routing_replay(
         ), f"{experts.shape}, expected (*, {num_layers}, {topk})"
 
     pad_size = mpu.get_tensor_model_parallel_world_size() * data_pad_size_multiplier
-    cp_size = mpu.get_context_parallel_world_size()
-    cp_rank = mpu.get_context_parallel_rank()
     range_start = 0
 
     if allgather_cp:
+        cp_size = mpu.get_context_parallel_world_size()
+        cp_rank = mpu.get_context_parallel_rank()
         total_rows = sum(experts.shape[0] + 1 for experts in rollout_routed_experts)
         global_pad_size = cp_size * pad_size
         pad = (global_pad_size - total_rows % global_pad_size) % global_pad_size
@@ -489,6 +524,8 @@ def prepare_routed_experts_for_routing_replay(
         range_start = cp_rank * cp_chunk_size
         range_end = range_start + cp_chunk_size
     else:
+        cp = cp or get_cp_context()
+        cp_size, cp_rank = cp.size, cp.rank
         sample_specs: list[tuple[_RoutedExpertsInput, int, list[tuple[int, int]]]] = []
         total_rows = 0
         for experts in rollout_routed_experts:

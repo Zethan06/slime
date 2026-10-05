@@ -231,6 +231,7 @@ def test_train_one_step_per_rollout_mean_report_invariant_to_cp(monkeypatch, moc
 
     def simulate(cp_size: int) -> float:
         monkeypatch.setattr(_mpu, "get_context_parallel_world_size", lambda: cp_size)
+        monkeypatch.setattr(_mpu, "get_context_parallel_group", lambda: None, raising=False)
         # values[0] is the per-token-loss path's num_tokens slot; for
         # per-rollout-mean it's a zero placeholder (loss_function sets 0).
         value_after_allreduce = 0.0
@@ -282,6 +283,7 @@ def test_train_one_step_per_token_loss_report_invariant_to_cp(monkeypatch, mock_
 
     def simulate(cp_size: int) -> float:
         monkeypatch.setattr(_mpu, "get_context_parallel_world_size", lambda: cp_size)
+        monkeypatch.setattr(_mpu, "get_context_parallel_group", lambda: None, raising=False)
         value_after_allreduce = 0.0
         num_tokens_after_allreduce = 0  # each CP rank reports the same num_tokens
         for cp_rank in range(cp_size):

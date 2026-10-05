@@ -2,10 +2,15 @@
 # and https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/trainer/ppo_utils/experience_maker.py
 
 from argparse import Namespace
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from slime.backends.megatron_utils.cp_utils import CPContext
 
 
 def get_pg_loss_type(args):
@@ -548,6 +553,7 @@ def get_reinforce_plus_plus_returns(
     total_lengths: list[int],
     kl_coef: float,
     gamma: float,
+    cps: Sequence["CPContext"] | None = None,
 ) -> list[torch.Tensor]:
     """
     Calculates discounted returns for REINFORCE++ (https://arxiv.org/pdf/2501.03262)
@@ -560,25 +566,25 @@ def get_reinforce_plus_plus_returns(
         total_lengths (List[int]): The full length of each sequence (prompt + response).
         kl_coef (float): Coefficient for the KL penalty.
         gamma (float): The discount factor.
+        cps (List[CPContext] | None): Each sequence's CP context; defaults to the static CP group.
 
     Returns:
         List[torch.Tensor]: A list of return (G_t) tensors for the
                             local sequence chunks owned by the current GPU rank.
     """
-    from megatron.core import mpu
+    from slime.backends.megatron_utils.cp_utils import all_gather_with_cp, get_cp_context, slice_log_prob_with_cp
 
-    cp_size = mpu.get_context_parallel_world_size()
+    if cps is None:
+        cps = [get_cp_context()] * len(rewards)
 
     token_level_rewards = []
     for i in range(len(rewards)):
         local_kl_chunk = kl[i]
         total_len, response_len = total_lengths[i], response_lengths[i]
 
-        if cp_size > 1:
+        if cps[i].size > 1:
             # Step 1,2:Gather all chunks and token_offsets from all ranks and reconstruct the full response tensor by splitting and placing each part
-            from slime.backends.megatron_utils.cp_utils import all_gather_with_cp
-
-            full_kl_response = all_gather_with_cp(local_kl_chunk, total_len, response_len)
+            full_kl_response = all_gather_with_cp(local_kl_chunk, total_len, response_len, cp=cps[i])
         else:
             full_kl_response = local_kl_chunk
 
@@ -604,11 +610,9 @@ def get_reinforce_plus_plus_returns(
     final_returns_chunks = []
     for i, returns_for_seq in enumerate(padded_returns):
         returns_for_seq = returns_for_seq[: token_level_rewards[i].size(0)]
-        if cp_size > 1:
-            from slime.backends.megatron_utils.cp_utils import slice_log_prob_with_cp
-
+        if cps[i].size > 1:
             total_len, response_len = total_lengths[i], response_lengths[i]
-            local_returns_chunk = slice_log_prob_with_cp(returns_for_seq, total_len, response_len)
+            local_returns_chunk = slice_log_prob_with_cp(returns_for_seq, total_len, response_len, cp=cps[i])
         else:
             local_returns_chunk = returns_for_seq
 
@@ -653,6 +657,7 @@ def get_advantages_and_returns_batch(
     gamma,
     lambd,
     chunked: bool = True,
+    cps: Sequence["CPContext"] | None = None,
 ):
     """
     Batched GAE with CP support.
@@ -661,40 +666,35 @@ def get_advantages_and_returns_batch(
         response_lengths:  list[int], each sample's response_len
         values_list:       list[Tensor], each shape = [resp_len_i]
         rewards_list:      list[Tensor], same shape
+        cps:               list[CPContext] | None, each sample's CP context
+                           (default: the static CP group)
     Output:
         advantages_list:   list[Tensor], each shape = [resp_len_i]
         returns_list:      list[Tensor], same shape
     """
 
-    from megatron.core import mpu
+    from slime.backends.megatron_utils.cp_utils import all_gather_with_cp, get_cp_context, slice_log_prob_with_cp
 
     with torch.no_grad():
         B = len(response_lengths)
         assert B == len(values_list)
         assert B == len(rewards_list)
+        if cps is None:
+            cps = [get_cp_context()] * B
 
-        cp_size = mpu.get_context_parallel_world_size()
         device = values_list[0].device
         dtype = values_list[0].dtype
 
-        if cp_size > 1:
-            from slime.backends.megatron_utils.cp_utils import all_gather_with_cp
-
-            full_values_list = []
-            full_rewards_list = []
-
-            for total_len, resp_len, v, r in zip(
-                total_lengths, response_lengths, values_list, rewards_list, strict=False
-            ):
-                full_v = all_gather_with_cp(v, total_len, resp_len)
-                full_r = all_gather_with_cp(r, total_len, resp_len)
-                full_values_list.append(full_v)
-                full_rewards_list.append(full_r)
-
-            # full_values_list[i].shape = [total_len_i]
-        else:
-            full_values_list = values_list
-            full_rewards_list = rewards_list
+        full_values_list = []
+        full_rewards_list = []
+        for total_len, resp_len, v, r, cp in zip(
+            total_lengths, response_lengths, values_list, rewards_list, cps, strict=False
+        ):
+            if cp.size > 1:
+                v = all_gather_with_cp(v, total_len, resp_len, cp=cp)
+                r = all_gather_with_cp(r, total_len, resp_len, cp=cp)
+            full_values_list.append(v)
+            full_rewards_list.append(r)
 
         # pad to max_len for batched GAE
         max_len = max(response_lengths)
@@ -724,31 +724,22 @@ def get_advantages_and_returns_batch(
 
         advantages_list = []
         returns_list = []
-
-        if cp_size > 1:
-            from slime.backends.megatron_utils.cp_utils import slice_log_prob_with_cp
-
-            for total_len, resp_len, adv_row, ret_row in zip(
-                total_lengths,
-                response_lengths,
-                full_advantages,
-                full_returns,
-                strict=False,
-            ):
-                adv_full = adv_row  # shape = [resp_len_i padded to max_len]
-                ret_full = ret_row
-
-                adv_sliced = slice_log_prob_with_cp(adv_full[:resp_len], total_len, resp_len)
-                ret_sliced = slice_log_prob_with_cp(ret_full[:resp_len], total_len, resp_len)
-
-                advantages_list.append(adv_sliced)
-                returns_list.append(ret_sliced)
-
-        else:
-            for i in range(B):
-                L = response_lengths[i]
-                advantages_list.append(full_advantages[i, :L])
-                returns_list.append(full_returns[i, :L])
+        for total_len, resp_len, adv_row, ret_row, cp in zip(
+            total_lengths,
+            response_lengths,
+            full_advantages,
+            full_returns,
+            cps,
+            strict=False,
+        ):
+            # Rows are padded to max_len; keep this sample's response and CP chunks.
+            adv_full = adv_row[:resp_len]
+            ret_full = ret_row[:resp_len]
+            if cp.size > 1:
+                adv_full = slice_log_prob_with_cp(adv_full, total_len, resp_len, cp=cp)
+                ret_full = slice_log_prob_with_cp(ret_full, total_len, resp_len, cp=cp)
+            advantages_list.append(adv_full)
+            returns_list.append(ret_full)
 
     return advantages_list, returns_list
 

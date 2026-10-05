@@ -1,9 +1,8 @@
-import sys
-import types
-
+import _cp_dist_helpers  # noqa: F401 - install the CPU megatron stub first
 import pytest
 import torch
 
+from slime.backends.megatron_utils.cp_utils import CPContext
 from slime.utils.ppo_utils import chunked_discounted_returns, chunked_gae, get_reinforce_plus_plus_returns, vanilla_gae
 
 
@@ -55,15 +54,7 @@ def test_chunked_discounted_returns_preserves_right_padding():
         assert torch.count_nonzero(actual[i, length:]) == 0
 
 
-def test_reinforce_plus_plus_returns_matches_serial_for_variable_lengths(monkeypatch):
-    mpu = types.SimpleNamespace(get_context_parallel_world_size=lambda: 1)
-    megatron = types.ModuleType("megatron")
-    megatron_core = types.ModuleType("megatron.core")
-    megatron_core.mpu = mpu
-    megatron.core = megatron_core
-    monkeypatch.setitem(sys.modules, "megatron", megatron)
-    monkeypatch.setitem(sys.modules, "megatron.core", megatron_core)
-
+def test_reinforce_plus_plus_returns_matches_serial_for_variable_lengths():
     rewards = torch.tensor([2.0, -1.0])
     kl = [torch.tensor([0.2, 0.1, 0.3, 0.4, 0.5]), torch.tensor([0.4, 0.2, 0.1])]
     loss_masks = [torch.tensor([0.0, 1.0, 1.0, 1.0, 0.0]), torch.tensor([1.0, 1.0, 1.0])]
@@ -78,6 +69,7 @@ def test_reinforce_plus_plus_returns_matches_serial_for_variable_lengths(monkeyp
         total_lengths=[5, 3],
         kl_coef=kl_coef,
         gamma=gamma,
+        cps=[CPContext(size=1, rank=0, group=None)] * 2,
     )
 
     expected = []

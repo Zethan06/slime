@@ -173,7 +173,7 @@ def test_save_debug_train_data_restores_cp_fields_by_default(tmp_path, monkeypat
 
     calls = []
 
-    def gather_tensor(value, total_length, response_length):
+    def gather_tensor(value, total_length, response_length, cp):
         calls.append((value.clone(), total_length, response_length))
         return torch.arange(response_length, dtype=torch.float32) + total_length
 
@@ -384,7 +384,7 @@ def test_restore_context_parallel_fields_rejects_misaligned_samples():
     with pytest.raises(ValueError, match="one tensor per sample"):
         restore_context_parallel_fields_to_cpu(
             rollout_data,
-            lambda value, _total, _response: value,
+            lambda value, _total, _response, cp: value,
             keep_restored=True,
         )
 

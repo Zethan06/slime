@@ -147,10 +147,11 @@ def log_rollout_data(
     """Summarize and report Megatron-side rollout fields."""
     from megatron.core import mpu
 
-    from slime.backends.megatron_utils.cp_utils import get_sum_of_sample_mean
+    from slime.backends.megatron_utils.cp_utils import get_sample_cp_contexts, get_sum_of_sample_mean
 
     if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
         cp_size = mpu.get_context_parallel_world_size()
+        cps = get_sample_cp_contexts(rollout_data)
         log_dict = {}
         response_lengths = rollout_data["response_lengths"]
         loss_masks = rollout_data["loss_masks"]
@@ -202,6 +203,7 @@ def log_rollout_data(
                             response_lengths,
                             loss_masks,
                             rollout_mask_sums,
+                            cps=cps,
                         )
                         sum_value, count = rollout_log_metric_contribution(
                             sum_of_sample_mean(tensor).item(),
@@ -245,6 +247,7 @@ def log_rollout_data(
         response_lengths = rollout_data["response_lengths"]
         loss_masks = rollout_data["loss_masks"]
         total_lengths = rollout_data["total_lengths"]
+        cps = get_sample_cp_contexts(rollout_data)
 
         def quantile(total_value, n_quantiles, data) -> dict:
             import math
@@ -272,12 +275,14 @@ def log_rollout_data(
         correct_response_lengths = []
         correct_total_lengths = []
         correct_loss_masks = []
+        correct_cps = []
         correct_entropy = []
         for i, raw_reward in enumerate(raw_rewards):
             if raw_reward == 1:
                 correct_response_lengths.append(response_lengths[i])
                 correct_total_lengths.append(total_lengths[i])
                 correct_loss_masks.append(loss_masks[i])
+                correct_cps.append(cps[i])
                 correct_entropy.append(-rollout_data["log_probs"][i])
         num_correct_responses = len(correct_total_lengths)
         rollout_data["correct_response_lengths"] = correct_response_lengths
@@ -294,6 +299,7 @@ def log_rollout_data(
                 correct_response_lengths,
                 correct_loss_masks,
                 sample_denoms=None,
+                cps=correct_cps,
             )
             correct_entropy_value = sum_of_sample_mean(torch.cat(correct_entropy, dim=0))
             rollout_data["correct_entropy"] = [correct_entropy_value.item()] * num_correct_responses

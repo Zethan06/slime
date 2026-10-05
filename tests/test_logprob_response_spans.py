@@ -12,6 +12,7 @@ NUM_GPUS = 0
 def _set_cp(monkeypatch, *, size: int, rank: int) -> None:
     monkeypatch.setattr(mpu, "get_context_parallel_world_size", lambda: size)
     monkeypatch.setattr(mpu, "get_context_parallel_rank", lambda: rank)
+    monkeypatch.setattr(mpu, "get_context_parallel_group", lambda: None, raising=False)
     monkeypatch.setattr(mpu, "get_tensor_model_parallel_rank", lambda: 0, raising=False)
 
 

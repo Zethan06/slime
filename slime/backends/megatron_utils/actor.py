@@ -39,7 +39,12 @@ from slime.utils.types import RolloutBatch
 
 from ...utils.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
-from .cp_utils import prepare_routed_experts_for_routing_replay, slice_log_prob_with_cp
+from .cp_utils import (
+    get_cp_context,
+    get_sample_cp_contexts,
+    prepare_routed_experts_for_routing_replay,
+    slice_log_prob_with_cp,
+)
 from .data import DataIterator, get_data_iterator
 from .hf_checkpoint_saver import save_hf_model_to_path
 from .initialize import init, is_megatron_main_rank
@@ -256,19 +261,21 @@ class MegatronTrainRayActor(TrainRayActor):
                 for mm_dict in rollout_data["multimodal_train_inputs"]
             ]
 
+        cps = get_sample_cp_contexts(rollout_data)
         for key in ["rollout_log_probs", "teacher_log_probs"]:
             if key not in rollout_data:
                 continue
             rollout_data[key] = [
-                slice_log_prob_with_cp(log_prob, total_length, response_length).to(
+                slice_log_prob_with_cp(log_prob, total_length, response_length, cp=cp).to(
                     device=device,
                     dtype=torch.float32,
                     non_blocking=True,
                 )
-                for log_prob, total_length, response_length in zip(
+                for log_prob, total_length, response_length, cp in zip(
                     rollout_data[key],
                     rollout_data["total_lengths"],
                     rollout_data["response_lengths"],
+                    cps,
                     strict=False,
                 )
             ]
@@ -279,12 +286,16 @@ class MegatronTrainRayActor(TrainRayActor):
                 (
                     value
                     if isinstance(value, TensorRef)
-                    else (value if self.args.allgather_cp else slice_log_prob_with_cp(value, total, response)).to(
-                        device="cpu", dtype=dtype
-                    )
+                    else (
+                        value if self.args.allgather_cp else slice_log_prob_with_cp(value, total, response, cp=cp)
+                    ).to(device="cpu", dtype=dtype)
                 )
-                for value, total, response in zip(
-                    rollout_data[key], rollout_data["total_lengths"], rollout_data["response_lengths"], strict=True
+                for value, total, response, cp in zip(
+                    rollout_data[key],
+                    rollout_data["total_lengths"],
+                    rollout_data["response_lengths"],
+                    cps,
+                    strict=True,
                 )
             ]
         return rollout_data
@@ -338,6 +349,9 @@ class MegatronTrainRayActor(TrainRayActor):
             batch_indices = iterator.micro_batch_indices[iterator.offset]
             batch = iterator.get_next(["rollout_routed_experts", "tokens"])
             values = batch["rollout_routed_experts"]
+            # Resolve the CP context here: disk-backed sources prepare in a
+            # background thread.
+            mb_prepare_kwargs = {**prepare_kwargs, "cp": get_cp_context(batch.get("cp_size"))}
 
             disk_backed = [isinstance(value, TensorRef) for value in values]
             if any(disk_backed) and not all(disk_backed):
@@ -350,7 +364,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     values,
                     batch["tokens"],
                     consumer_count=len(layer_ids),
-                    prepare_kwargs=prepare_kwargs,
+                    prepare_kwargs=mb_prepare_kwargs,
                 )
                 disk_prefetcher.add(source)
                 for replay, layer_id in zip(RoutingReplay.all_routing_replays, layer_ids, strict=True):
@@ -359,7 +373,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 rollout_routed_experts = prepare_routed_experts_for_routing_replay(
                     values,
                     batch["tokens"],
-                    **prepare_kwargs,
+                    **mb_prepare_kwargs,
                 )
                 for replay, layer_id in zip(RoutingReplay.all_routing_replays, layer_ids, strict=True):
                     replay.record(rollout_routed_experts[:, layer_id])

@@ -441,6 +441,7 @@ def forward_only(
             "total_lengths": total_lengths,
             "response_lengths": response_lengths,
             "with_entropy": args.use_rollout_entropy,
+            "cp": batch["cp"],
         }
         if use_rollout_top_p_replay:
             output_kwargs.update(get_rollout_top_p_logprob_kwargs(args, batch))

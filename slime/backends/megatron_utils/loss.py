@@ -31,8 +31,11 @@ from slime.utils.score_centering import get_score_centering_is_config, score_cen
 from slime.utils.types import RolloutBatch
 
 from .cp_utils import (
+    CPContext,
     all_gather_with_cp,
+    get_cp_context,
     get_logits_and_tokens_offset_with_cp,
+    get_sample_cp_contexts,
     get_sum_of_sample_mean,
     slice_log_prob_with_cp,
 )
@@ -108,6 +111,7 @@ def get_responses(
     total_lengths: list[int],
     response_lengths: list[int],
     apply_temperature: bool = True,
+    cp: CPContext | None = None,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
     """Yield response-aligned `(logits_chunk, tokens_chunk)` pairs per sample.
 
@@ -125,6 +129,7 @@ def get_responses(
         total_lengths: Total sequence lengths (prompt+response) per sample.
         response_lengths: Response segment lengths per sample.
         apply_temperature: Whether to divide outputs by `rollout_temperature`.
+        cp: CP context of the micro-batch; defaults to the static CP group.
 
     Yields:
         Tuple of `(logits_chunk, tokens_chunk)` where `logits_chunk` is shape
@@ -139,11 +144,11 @@ def get_responses(
     if apply_temperature and args.rollout_temperature != 1.0:
         logits = logits.div(args.rollout_temperature)
 
-    cp_size = mpu.get_context_parallel_world_size()
+    cp = cp or get_cp_context()
     end = 0
     seq_start = 0
     for tokens, total_length, response_length in zip(unconcat_tokens, total_lengths, response_lengths, strict=False):
-        if cp_size == 1:
+        if cp.size == 1:
             end += total_length
             start = end - response_length
             logits_chunk = logits[start - 1 : end - 1]
@@ -174,7 +179,7 @@ def get_responses(
         else:
             # TODO: this is super ugly... do better abstraction.
             chunk_size, chunks_offset, logits_offset, tokens_offset = get_logits_and_tokens_offset_with_cp(
-                total_length, response_length
+                total_length, response_length, cp=cp
             )
 
             logits_0, logits_1 = logits[end : end + chunk_size], logits[end + chunk_size : end + 2 * chunk_size]
@@ -283,19 +288,21 @@ def _build_shifted_tokens(
     total_lengths: list[int],
     response_lengths: list[int],
     allgather_cp: bool,
+    *,
+    cp: CPContext | None = None,
 ) -> torch.Tensor:
     """Build shifted target tokens for the full packed/padded logits."""
-    cp_size = mpu.get_context_parallel_world_size()
+    cp = cp or get_cp_context()
 
     # --- zigzag CP: completely different layout ---
-    if cp_size > 1 and not allgather_cp:
+    if cp.size > 1 and not allgather_cp:
         full_tokens = torch.zeros(T, dtype=torch.long, device=device)
         end = 0
         for tokens, total_length, response_length in zip(
             unconcat_tokens, total_lengths, response_lengths, strict=False
         ):
             chunk_size_cp, chunks_offset, logits_offset, tokens_offset = get_logits_and_tokens_offset_with_cp(
-                total_length, response_length
+                total_length, response_length, cp=cp
             )
             for half, base in ((0, end), (1, end + chunk_size_cp)):
                 lo = logits_offset[half][0] - chunks_offset[half][0]
@@ -369,6 +376,8 @@ def _build_topp_keep_mask(
     total_lengths: list[int],
     response_lengths: list[int],
     allgather_cp: bool,
+    *,
+    cp: CPContext | None = None,
 ) -> torch.Tensor:
     """Build a ``[T, vocab_local]`` boolean keep-mask aligned to local logits.
 
@@ -376,7 +385,7 @@ def _build_topp_keep_mask(
     ``ids[offsets[r]:offsets[r + 1]]``. Rows without a recorded nucleus stay
     all-True, so only response rows with replay data are masked.
     """
-    cp_size = mpu.get_context_parallel_world_size()
+    cp = cp or get_cp_context()
     tp_rank = mpu.get_tensor_model_parallel_rank()
     vocab_start = tp_rank * vocab_local
     vocab_end = vocab_start + vocab_local
@@ -389,14 +398,14 @@ def _build_topp_keep_mask(
 
     keep = torch.ones((T, vocab_local), dtype=torch.bool, device=device)
 
-    if cp_size > 1 and not allgather_cp:
+    if cp.size > 1 and not allgather_cp:
         local_base = 0
         for ids, offsets, total_length, response_length in zip(
             top_p_token_ids, top_p_token_offsets, total_lengths, response_lengths, strict=False
         ):
             prompt_length = total_length - response_length
             chunk_size_cp, chunks_offset, logits_offset, tokens_offset = get_logits_and_tokens_offset_with_cp(
-                total_length, response_length
+                total_length, response_length, cp=cp
             )
             for half, base in ((0, local_base), (1, local_base + chunk_size_cp)):
                 local_start = base + logits_offset[half][0] - chunks_offset[half][0]
@@ -451,18 +460,20 @@ def _extract_per_sample(
     total_lengths: list[int],
     response_lengths: list[int],
     allgather_cp: bool,
+    *,
+    cp: CPContext | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor | None]]:
     """Slice per-sample response log-probs/entropy from full-length 1-D tensors."""
-    cp_size = mpu.get_context_parallel_world_size()
+    cp = cp or get_cp_context()
     log_probs_list: list[torch.Tensor] = []
     entropy_list: list[torch.Tensor] = []
 
-    if cp_size > 1 and not allgather_cp:
+    if cp.size > 1 and not allgather_cp:
         # zigzag CP
         pos = 0
         for total_length, response_length in zip(total_lengths, response_lengths, strict=False):
             chunk_size_cp, chunks_offset, logits_offset, _tokens_offset = get_logits_and_tokens_offset_with_cp(
-                total_length, response_length
+                total_length, response_length, cp=cp
             )
             lo0 = logits_offset[0][0] - chunks_offset[0][0]
             hi0 = logits_offset[0][1] - chunks_offset[0][0]
@@ -537,6 +548,7 @@ def get_log_probs_and_entropy(
     non_loss_data: bool = True,
     top_p_token_ids: list[list[int]] | None = None,
     top_p_token_offsets: list[list[int]] | None = None,
+    cp: CPContext | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Compute per-token log-probabilities (and optionally entropy) on responses.
 
@@ -567,7 +579,9 @@ def get_log_probs_and_entropy(
     with_entropy_grad = with_entropy and getattr(args, "entropy_coef", 0.0) != 0
 
     # --- build full shifted-token target tensor ---
-    full_tokens = _build_shifted_tokens(T, device, unconcat_tokens, total_lengths, response_lengths, args.allgather_cp)
+    full_tokens = _build_shifted_tokens(
+        T, device, unconcat_tokens, total_lengths, response_lengths, args.allgather_cp, cp=cp
+    )
 
     # --- build top-p nucleus keep-mask (logprob only; entropy stays unmasked) ---
     top_p_keep_mask = None
@@ -581,6 +595,7 @@ def get_log_probs_and_entropy(
             total_lengths,
             response_lengths,
             args.allgather_cp,
+            cp=cp,
         )
 
     # --- compute on full [T,V] logits at once via calculate_log_probs_and_entropy ---
@@ -602,6 +617,7 @@ def get_log_probs_and_entropy(
         total_lengths,
         response_lengths,
         args.allgather_cp,
+        cp=cp,
     )
 
     res = {"log_probs": log_probs_list}
@@ -629,6 +645,7 @@ def get_values(
     response_lengths: list[int],
     with_entropy: bool = False,
     non_loss_data: bool = True,
+    cp: CPContext | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Extract per-token value predictions over response tokens.
 
@@ -644,6 +661,7 @@ def get_values(
         response_lengths: Response segment lengths per sample.
         with_entropy: Unused; kept for signature compatibility.
         non_loss_data: Unused; kept for signature compatibility.
+        cp: CP context of the micro-batch; defaults to the static CP group.
 
     Returns:
         Dict with key "values" mapping to a list of `[R]` value tensors
@@ -657,6 +675,7 @@ def get_values(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         apply_temperature=False,
+        cp=cp,
     ):
         assert logits_chunk.size(-1) == 1, f"{logits_chunk.shape}"
         value_list.append(logits_chunk.squeeze(-1))
@@ -755,6 +774,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     # return when not the last pp stage.
     if not mpu.is_pipeline_last_stage():
         return
+    cps = get_sample_cp_contexts(rollout_data)
 
     if args.kl_coef == 0 or not log_probs:
         # when kl_coef is 0, we won't compute ref_log_prob
@@ -786,14 +806,13 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         old_rewards = rewards
         rewards = []
         kl_coef = -args.kl_coef
-        cp_rank = mpu.get_context_parallel_rank()
-        for reward, per_token_kl in zip(old_rewards, kl, strict=False):
+        for reward, per_token_kl, cp in zip(old_rewards, kl, cps, strict=False):
             token_level_rewards = per_token_kl * kl_coef
-            if cp_rank == 0:
+            if cp.rank == 0:
                 token_level_rewards[-1] += reward
             rewards.append(token_level_rewards)
         advantages, returns = get_advantages_and_returns_batch(
-            total_lengths, response_lengths, values, rewards, args.gamma, args.lambd
+            total_lengths, response_lengths, values, rewards, args.gamma, args.lambd, cps=cps
         )
 
     elif args.advantage_estimator == "reinforce_plus_plus":
@@ -806,6 +825,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             total_lengths=total_lengths,
             kl_coef=args.kl_coef,
             gamma=args.gamma,
+            cps=cps,
         )
         advantages = [r for r in returns]
 
@@ -833,39 +853,38 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     # TODO: OpenRLHF always does advantages normalization but veRL doesn't seem to do it.
     if args.normalize_advantages:
         all_advs = torch.cat(advantages)
-        cp_size = mpu.get_context_parallel_world_size()
-        if cp_size == 1:
-            all_masks = torch.cat(loss_masks)
-        else:
-            mask_chunks = []
-            for i in range(len(advantages)):
-                total_len = total_lengths[i]
-                response_len = response_lengths[i]
-                prompt_len = total_len - response_len
-                _, _, _, token_offsets = get_logits_and_tokens_offset_with_cp(total_len, response_len)
+        mask_chunks = []
+        for i in range(len(advantages)):
+            if cps[i].size == 1:
+                mask_chunks.append(loss_masks[i])
+                continue
+            total_len = total_lengths[i]
+            response_len = response_lengths[i]
+            prompt_len = total_len - response_len
+            _, _, _, token_offsets = get_logits_and_tokens_offset_with_cp(total_len, response_len, cp=cps[i])
 
-                # Convert global offsets to response-space offsets
-                s0, e0 = token_offsets[0]
-                s1, e1 = token_offsets[1]
-                res_s0, res_e0 = max(0, s0 - prompt_len), max(0, e0 - prompt_len)
-                res_s1, res_e1 = max(0, s1 - prompt_len), max(0, e1 - prompt_len)
+            # Convert global offsets to response-space offsets
+            s0, e0 = token_offsets[0]
+            s1, e1 = token_offsets[1]
+            res_s0, res_e0 = max(0, s0 - prompt_len), max(0, e0 - prompt_len)
+            res_s1, res_e1 = max(0, s1 - prompt_len), max(0, e1 - prompt_len)
 
-                local_mask_parts = []
-                full_mask = loss_masks[i]
-                if res_e0 > res_s0:
-                    local_mask_parts.append(full_mask[res_s0:res_e0])
-                if res_e1 > res_s1:
-                    local_mask_parts.append(full_mask[res_s1:res_e1])
+            local_mask_parts = []
+            full_mask = loss_masks[i]
+            if res_e0 > res_s0:
+                local_mask_parts.append(full_mask[res_s0:res_e0])
+            if res_e1 > res_s1:
+                local_mask_parts.append(full_mask[res_s1:res_e1])
 
-                # Concatenate the parts to form the final mask chunk for this rank and this sequence
-                local_mask_chunk = (
-                    torch.cat(local_mask_parts)
-                    if local_mask_parts
-                    else torch.tensor([], device=all_advs.device, dtype=full_mask.dtype)
-                )
-                mask_chunks.append(local_mask_chunk)
+            # Concatenate the parts to form the final mask chunk for this rank and this sequence
+            local_mask_chunk = (
+                torch.cat(local_mask_parts)
+                if local_mask_parts
+                else torch.tensor([], device=all_advs.device, dtype=full_mask.dtype)
+            )
+            mask_chunks.append(local_mask_chunk)
 
-            all_masks = torch.cat(mask_chunks)
+        all_masks = torch.cat(mask_chunks)
 
         assert (
             all_advs.size() == all_masks.size()
@@ -977,7 +996,7 @@ def get_score_centering_terms(args, batch, logits):
     the paper's top-k approximation. Redistribute the scalar correction before
     multiplying by zigzag-CP advantages.
     """
-    total_lengths, response_lengths = batch["total_lengths"], batch["response_lengths"]
+    total_lengths, response_lengths, cp = batch["total_lengths"], batch["response_lengths"], batch["cp"]
     if args.rollout_top_p < 1:
         if batch.get("rollout_top_p_log_probs") is None or batch.get("rollout_log_probs") is None:
             raise ValueError("Top-p score centering requires complete sampler top-p and sampled-token logprobs.")
@@ -990,7 +1009,7 @@ def get_score_centering_terms(args, batch, logits):
             row_indices = _slice_allgather_response_rows(row_indices, total_lengths, response_lengths, logits.size(1))
         else:
             row_indices = [
-                slice_log_prob_with_cp(indices, total, response)
+                slice_log_prob_with_cp(indices, total, response, cp=cp)
                 for indices, total, response in zip(row_indices, total_lengths, response_lengths, strict=True)
             ]
         weighting = get_score_centering_is_config(args)
@@ -1003,6 +1022,7 @@ def get_score_centering_terms(args, batch, logits):
                 total_lengths=total_lengths,
                 response_lengths=response_lengths,
                 apply_temperature=False,
+                cp=cp,
             ),
             row_indices,
             batch["rollout_top_p_token_ids"],
@@ -1061,11 +1081,7 @@ def get_score_centering_terms(args, batch, logits):
         def local_heads(values):
             return [
                 (
-                    (
-                        value[:]
-                        if mpu.get_context_parallel_world_size() == 1
-                        else slice_log_prob_with_cp(value, total, response)
-                    )
+                    (value[:] if cp.size == 1 else slice_log_prob_with_cp(value, total, response, cp=cp))
                     if isinstance(value, TensorRef)
                     else value
                 )
@@ -1083,6 +1099,7 @@ def get_score_centering_terms(args, batch, logits):
             total_lengths=total_lengths,
             response_lengths=response_lengths,
             apply_temperature=False,
+            cp=cp,
         ),
         ids,
         sampler_head,
@@ -1152,6 +1169,7 @@ def policy_loss_function(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         with_entropy=True,
+        cp=batch["cp"],
         **get_rollout_top_p_logprob_kwargs(args, batch),
     )
 
@@ -1173,13 +1191,13 @@ def policy_loss_function(
     full_old_log_probs = None
     if need_full_log_probs:
         full_log_probs = [
-            all_gather_with_cp(log_prob, total_length, response_length)
+            all_gather_with_cp(log_prob, total_length, response_length, cp=batch["cp"])
             for log_prob, total_length, response_length in zip(
                 log_probs, total_lengths, response_lengths, strict=False
             )
         ]
         full_old_log_probs = [
-            all_gather_with_cp(old_log_prob, total_length, response_length)
+            all_gather_with_cp(old_log_prob, total_length, response_length, cp=batch["cp"])
             for old_log_prob, total_length, response_length in zip(
                 old_log_probs, total_lengths, response_lengths, strict=False
             )
@@ -1270,6 +1288,7 @@ def policy_loss_function(
             modified_response_masks,
             batch["rollout_mask_sums"],
             args.calculate_per_token_loss,
+            cps=[batch["cp"]] * len(total_lengths),
         )
 
     sc_terms = {}
@@ -1398,6 +1417,7 @@ def value_loss_function(
         unconcat_tokens=batch["unconcat_tokens"],
         total_lengths=batch["total_lengths"],
         response_lengths=batch["response_lengths"],
+        cp=batch["cp"],
     )
     values = torch.cat([value.flatten() for value in values["values"]], dim=0)
 
@@ -1456,6 +1476,7 @@ def sft_loss_function(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         with_entropy=False,
+        cp=batch["cp"],
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -1516,6 +1537,7 @@ def loss_function(
         batch["loss_masks"],
         batch["rollout_mask_sums"],
         args.calculate_per_token_loss,
+        cps=[batch["cp"]] * len(batch["total_lengths"]),
     )
 
     match args.loss_type:

@@ -55,6 +55,7 @@ import types
 _fake_mpu = types.ModuleType("megatron.core.mpu")
 _fake_mpu.get_context_parallel_world_size = lambda: 1
 _fake_mpu.get_context_parallel_rank = lambda: 0
+_fake_mpu.get_context_parallel_group = lambda: None
 _fake_core = types.ModuleType("megatron.core")
 _fake_core.mpu = _fake_mpu
 _fake_megatron = types.ModuleType("megatron")

@@ -24,8 +24,13 @@ import pytest
 import torch
 
 from slime.backends.megatron_utils.cp_utils import (  # noqa: E402
+    CPContext,
+    all_gather_with_cp,
     get_logits_and_tokens_offset_with_cp,
+    get_sample_cp_contexts,
     get_sum_of_sample_mean,
+    slice_log_prob_with_cp,
+    slice_with_cp,
 )
 
 
@@ -150,6 +155,7 @@ def test_cp_chunking_preserves_per_rollout_mean_report(monkeypatch):
     x_concat = torch.cat(x_full)
 
     # --- cp=1 baseline ---
+    monkeypatch.setattr(_mpu, "get_context_parallel_group", lambda: None, raising=False)
     monkeypatch.setattr(_mpu, "get_context_parallel_world_size", lambda: 1)
     monkeypatch.setattr(_mpu, "get_context_parallel_rank", lambda: 0)
     reducer_cp1 = get_sum_of_sample_mean(total_lengths, response_lengths, loss_masks, sample_denoms)
@@ -174,6 +180,140 @@ def test_cp_chunking_preserves_per_rollout_mean_report(monkeypatch):
         cp_total += reducer_cp2(x_for_rank).item()
 
     assert cp_total == pytest.approx(baseline)
+
+
+def _set_static_cp(monkeypatch, size: int, rank: int) -> None:
+    from megatron.core import mpu as _mpu
+
+    monkeypatch.setattr(_mpu, "get_context_parallel_world_size", lambda: size)
+    monkeypatch.setattr(_mpu, "get_context_parallel_rank", lambda: rank)
+    monkeypatch.setattr(_mpu, "get_context_parallel_group", lambda: None, raising=False)
+
+
+def _cp_helper_outputs(total_lengths, response_lengths, loss_masks, cp=None):
+    """Run every per-sample CP helper; ``cp=None`` reads the static CP state."""
+    cps = None if cp is None else [cp] * len(total_lengths)
+    offsets = [
+        get_logits_and_tokens_offset_with_cp(t, r, cp=cp) for t, r in zip(total_lengths, response_lengths, strict=True)
+    ]
+    token_slices = [slice_with_cp(torch.arange(t), -1, cp=cp) for t in total_lengths]
+    response_slices = [
+        slice_log_prob_with_cp(torch.arange(r, dtype=torch.float32), t, r, cp=cp)
+        for t, r in zip(total_lengths, response_lengths, strict=True)
+    ]
+    list_slices = [
+        slice_log_prob_with_cp(list(range(r)), t, r, cp=cp)
+        for t, r in zip(total_lengths, response_lengths, strict=True)
+    ]
+    reducer = get_sum_of_sample_mean(total_lengths, response_lengths, loss_masks, cps=cps)
+    return offsets, token_slices, response_slices, list_slices, reducer(torch.cat(response_slices) + 1).item()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("cp_size", "cp_rank"), [(size, rank) for size in (2, 4) for rank in range(size)])
+def test_explicit_cp_context_matches_static_cp(monkeypatch, cp_size, cp_rank):
+    """An explicit CPContext slices exactly like the same static CP state, and
+    does not read the static state at all."""
+    # Lengths not divisible by 2 * cp_size exercise the zigzag padding; the
+    # short sample leaves some ranks without response tokens.
+    total_lengths, response_lengths = [23, 9, 40], [15, 2, 33]
+    loss_masks = [(torch.arange(r) % 3 != 0).float() for r in response_lengths]
+
+    _set_static_cp(monkeypatch, cp_size, cp_rank)
+    static = _cp_helper_outputs(total_lengths, response_lengths, loss_masks)
+
+    _set_static_cp(monkeypatch, 1, 0)
+    explicit = _cp_helper_outputs(
+        total_lengths, response_lengths, loss_masks, cp=CPContext(size=cp_size, rank=cp_rank, group=None)
+    )
+
+    static_offsets, static_tokens, static_responses, static_lists, static_reduced = static
+    offsets, tokens, responses, lists, reduced = explicit
+    assert offsets == static_offsets
+    assert all(torch.equal(a, b) for a, b in zip(tokens, static_tokens, strict=True))
+    assert all(torch.equal(a, b) for a, b in zip(responses, static_responses, strict=True))
+    assert lists == static_lists
+    assert reduced == static_reduced
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_cp_slices_from_all_ranks_reassemble_sequence(monkeypatch, cp_size):
+    """Rank r holds zigzag chunks r and 2*cp_size-1-r; together the ranks cover
+    the padded sequence, and their response slices gather back losslessly."""
+    import torch.distributed.nn
+
+    _set_static_cp(monkeypatch, 1, 0)
+    total_length, response_length = 23, 15
+    group = object()
+    cps = [CPContext(size=cp_size, rank=rank, group=group) for rank in range(cp_size)]
+
+    tokens = torch.arange(total_length) + 100
+    token_slices = [slice_with_cp(tokens, -1, cp=cp) for cp in cps]
+    chunk_size = token_slices[0].size(0) // 2
+    chunks = [None] * (2 * cp_size)
+    for rank, local in enumerate(token_slices):
+        chunks[rank], chunks[2 * cp_size - 1 - rank] = local[:chunk_size], local[chunk_size:]
+    padded = torch.cat(chunks)
+    assert torch.equal(padded[:total_length], tokens)
+    assert (padded[total_length:] == -1).all()
+
+    # Each rank's all_gather input is its slice zero-filled to the full
+    # response; summing them stands in for the CP all-reduce.
+    reduce_groups = []
+
+    def fake_all_reduce(tensor, group):
+        reduce_groups.append(group)
+        return tensor
+
+    monkeypatch.setattr(torch.distributed.nn, "all_reduce", fake_all_reduce)
+    response = torch.arange(response_length, dtype=torch.float32) + 1
+    gathered = sum(
+        all_gather_with_cp(
+            slice_log_prob_with_cp(response, total_length, response_length, cp=cp),
+            total_length,
+            response_length,
+            cp=cp,
+        )
+        for cp in cps
+    )
+    assert torch.equal(gathered.detach(), response)
+    assert reduce_groups == [group] * cp_size
+
+
+@pytest.mark.unit
+def test_get_sum_of_sample_mean_accepts_per_sample_contexts(monkeypatch):
+    """Samples may sit on different CP contexts: each one is reduced over its
+    own chunks, matching the reducer built for that context alone."""
+    _set_static_cp(monkeypatch, 1, 0)
+    total_lengths, response_lengths = [12, 12], [8, 8]
+    loss_masks = [torch.ones(8), torch.tensor([1.0, 0, 1, 1, 0, 1, 1, 1])]
+    sample_denoms = _denoms(16, 16)
+    x_full = [torch.arange(8, dtype=torch.float32) + 1, torch.arange(8, dtype=torch.float32) * 10]
+    cp1, cp2 = CPContext(size=1, rank=0, group=None), CPContext(size=2, rank=1, group=None)
+
+    x_cp2 = slice_log_prob_with_cp(x_full[1], total_lengths[1], response_lengths[1], cp=cp2)
+    mixed = get_sum_of_sample_mean(total_lengths, response_lengths, loss_masks, sample_denoms, cps=[cp1, cp2])
+    first = get_sum_of_sample_mean(total_lengths[:1], response_lengths[:1], loss_masks[:1], sample_denoms[:1])
+    second = get_sum_of_sample_mean(
+        total_lengths[1:], response_lengths[1:], loss_masks[1:], sample_denoms[1:], cps=[cp2]
+    )
+
+    expected = first(x_full[0]) + second(x_cp2)
+    assert mixed(torch.cat([x_full[0], x_cp2])).item() == pytest.approx(expected.item())
+
+
+@pytest.mark.unit
+def test_sample_cp_contexts_follow_rank_local_samples(monkeypatch):
+    """``total_lengths`` arrives un-partitioned; the context count must follow
+    the rank-local samples."""
+    _set_static_cp(monkeypatch, 2, 1)
+    rollout_data = {"total_lengths": [5, 6, 7, 8], "response_lengths": [2, 3]}
+    assert get_sample_cp_contexts(rollout_data) == [CPContext(size=2, rank=1, group=None)] * 2
+
+    assert get_sample_cp_contexts({**rollout_data, "cp_sizes": [2, 2]}) == [CPContext(size=2, rank=1, group=None)] * 2
+    with pytest.raises(NotImplementedError):
+        get_sample_cp_contexts({**rollout_data, "cp_sizes": [2, 4]})
 
 
 if __name__ == "__main__":

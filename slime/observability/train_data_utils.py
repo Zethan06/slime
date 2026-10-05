@@ -27,24 +27,21 @@ _CONTEXT_PARALLEL_FIELDS = (
 _SAMPLER_HEAD_FIELDS = ("rollout_topk_token_ids", "rollout_topk_log_probs")
 
 
-def _gather_sampler_heads_with_cp(value, total_length, response_length):
+def _gather_sampler_heads_with_cp(value, total_length, response_length, cp):
     """Restore CPU heads without casting integer ids or using autograd collectives."""
-    from megatron.core import mpu
-
     from slime.backends.megatron_utils.cp_utils import get_logits_and_tokens_offset_with_cp
 
-    if mpu.get_context_parallel_world_size() == 1:
+    if cp.size == 1:
         return value.detach().cpu()
-    group = mpu.get_context_parallel_group()
     device = (
         torch.device("cuda", torch.cuda.current_device())
-        if torch.distributed.get_backend(group) == "nccl"
+        if torch.distributed.get_backend(cp.group) == "nccl"
         else value.device
     )
     # Bound extra device storage to one sample; disk-backed heads never enter
     # this path. NCCL requires CUDA tensors even though heads live on CPU.
     full = torch.zeros((response_length, *value.shape[1:]), dtype=value.dtype, device=device)
-    _, _, offsets, _ = get_logits_and_tokens_offset_with_cp(total_length, response_length)
+    _, _, offsets, _ = get_logits_and_tokens_offset_with_cp(total_length, response_length, cp=cp)
     prompt_length = total_length - response_length
     offset = 0
     for start, end in offsets:
@@ -55,7 +52,7 @@ def _gather_sampler_heads_with_cp(value, total_length, response_length):
     if offset != value.size(0):
         raise ValueError(f"Sampler head CP shard has {value.size(0)} rows, expected {offset}.")
     if full.numel():
-        torch.distributed.all_reduce(full, group=group)
+        torch.distributed.all_reduce(full, group=cp.group)
     return full
 
 
@@ -74,12 +71,18 @@ def _to_cpu(value):
 @torch.no_grad()
 def restore_context_parallel_fields_to_cpu(
     rollout_data: dict[str, Any],
-    gather_tensor: Callable[[torch.Tensor, int, int], torch.Tensor],
+    gather_tensor: Callable[..., torch.Tensor],
     *,
     keep_restored: bool,
     allgather_cp: bool = False,
 ) -> dict[str, Any] | None:
-    """Restore CP fields one tensor at a time, retaining CPU values only on the writer."""
+    """Restore CP fields one tensor at a time, retaining CPU values only on the writer.
+
+    ``gather_tensor(value, total_length, response_length, cp=...)`` restores one
+    sample's full response tensor from its CP shards.
+    """
+    from slime.backends.megatron_utils.cp_utils import get_sample_cp_contexts
+
     total_lengths = rollout_data["total_lengths"]
     response_lengths = rollout_data["response_lengths"]
     num_samples = len(response_lengths)
@@ -88,6 +91,7 @@ def restore_context_parallel_fields_to_cpu(
             "total_lengths and response_lengths must contain the same number of samples, "
             f"got {len(total_lengths)} and {num_samples}."
         )
+    cps = get_sample_cp_contexts(rollout_data)
 
     restored = (
         {
@@ -105,14 +109,14 @@ def restore_context_parallel_fields_to_cpu(
         if len(values) != num_samples:
             raise ValueError(f"Sampler head field {key!r} must contain one value per sample.")
         full_values = [] if keep_restored else None
-        for value, total_length, response_length in zip(values, total_lengths, response_lengths, strict=True):
+        for value, total_length, response_length, cp in zip(values, total_lengths, response_lengths, cps, strict=True):
             # Disk references and allgather-CP heads retain full response rows.
             if isinstance(value, TensorRef) or allgather_cp:
                 full_value = value
                 if len(full_value) != response_length:
                     raise ValueError(f"Full sampler head field {key!r} must have {response_length} rows.")
             else:
-                full_value = _gather_sampler_heads_with_cp(value, int(total_length), int(response_length))
+                full_value = _gather_sampler_heads_with_cp(value, int(total_length), int(response_length), cp)
             if keep_restored:
                 full_values.append(_to_cpu(full_value))
             del full_value
@@ -130,14 +134,14 @@ def restore_context_parallel_fields_to_cpu(
             )
 
         full_values = [] if keep_restored else None
-        for sample_id, (value, total_length, response_length) in enumerate(
-            zip(values, total_lengths, response_lengths, strict=True)
+        for sample_id, (value, total_length, response_length, cp) in enumerate(
+            zip(values, total_lengths, response_lengths, cps, strict=True)
         ):
             if not torch.is_tensor(value):
                 raise TypeError(
                     f"CP-sharded field {key!r} sample {sample_id} must be a tensor, got {type(value).__name__}."
                 )
-            full_value = gather_tensor(value, int(total_length), int(response_length)).detach()
+            full_value = gather_tensor(value, int(total_length), int(response_length), cp=cp).detach()
             if full_value.size(0) != response_length:
                 raise ValueError(
                     f"Restored field {key!r} sample {sample_id} has length {full_value.size(0)}, "

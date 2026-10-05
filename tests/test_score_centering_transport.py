@@ -456,6 +456,7 @@ def test_top_p_mask_reads_only_local_cp_support(tmp_path, monkeypatch, rank, all
 
     monkeypatch.setattr(mpu, "get_context_parallel_world_size", lambda: 2)
     monkeypatch.setattr(mpu, "get_context_parallel_rank", lambda: rank)
+    monkeypatch.setattr(mpu, "get_context_parallel_group", lambda: None, raising=False)
     monkeypatch.setattr(mpu, "get_tensor_model_parallel_rank", lambda: 0, raising=False)
     with SharedFilesystemStore(tmp_path, "cp-mask", codecs=("tensor.v1",)) as store:
         ids, offsets = publish_tensors(
