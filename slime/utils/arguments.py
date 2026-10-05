@@ -309,6 +309,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
             )
+            # reset_arg: newer Megatron generates this flag from its config field.
+            reset_arg(
+                parser,
+                "--dynamic-context-parallel",
+                action="store_true",
+                default=False,
+                help=(
+                    "Dynamic context parallel (DCP): schedule every micro-batch onto an aligned power-of-2 "
+                    "block of the DP x CP ranks and pick its CP size from its sequence lengths, with "
+                    "--max-tokens-per-gpu as the per-rank token budget."
+                ),
+            )
 
             return parser
 

@@ -162,7 +162,7 @@ def restore_context_parallel_fields_to_cpu(
 
 # Per-rank scheduling arrangement (not per-sample); stored under `dp_shards` so
 # the flat `samples` view can stay aligned with the rollout debug dump.
-_LAYOUT_FIELDS = ("micro_batch_indices", "num_microbatches", "global_batch_sizes")
+_LAYOUT_FIELDS = ("micro_batch_indices", "micro_batch_cp_sizes", "num_microbatches", "global_batch_sizes")
 # Whole-batch fields that are identical on every DP shard; stored once at the top.
 _WHOLE_BATCH_FIELDS = ("raw_reward",)
 
@@ -173,6 +173,20 @@ def _is_per_sample(value, num_samples: int) -> bool:
     if isinstance(value, (list, tuple)):
         return len(value) == num_samples
     return False
+
+
+def _select_samples(rollout_data: dict[str, Any], keep: list[bool]) -> dict[str, Any]:
+    """Drop the samples whose ``keep`` flag is False from every per-sample field."""
+    num_samples = len(keep)
+    selected = {}
+    for key, value in rollout_data.items():
+        if key in _LAYOUT_FIELDS or key in _WHOLE_BATCH_FIELDS or not _is_per_sample(value, num_samples):
+            selected[key] = value
+        elif torch.is_tensor(value):
+            selected[key] = value[torch.tensor(keep, dtype=torch.bool)]
+        else:
+            selected[key] = [item for item, kept in zip(value, keep, strict=True) if kept]
+    return selected
 
 
 def _build_dump_payload(dp_shards, *, rollout_id, writer_rank):
@@ -266,29 +280,37 @@ def save_debug_train_data(args, *, rollout_id, rollout_data):
     if not mpu.is_pipeline_last_stage(ignore_virtual=True) or mpu.get_tensor_model_parallel_rank() != 0:
         return
 
-    from slime.backends.megatron_utils.cp_utils import all_gather_with_cp
+    from slime.backends.megatron_utils.cp_utils import all_gather_with_cp, get_sample_cp_contexts
 
+    # Static CP: the ranks of a CP group share samples, so static CP rank 0 writes and
+    # shards are gathered over DP. Dynamic CP: every DP x CP rank holds its own
+    # schedule, so each sample is written by rank 0 of its own CP block and shards are
+    # gathered over DP x CP.
+    dynamic_cp = getattr(args, "dynamic_context_parallel", False)
     # All CP ranks in the selected PP/TP group must enter these collectives.
     # CP=1 follows the same normalization path but all_gather_with_cp is an identity.
     cp_rank = mpu.get_context_parallel_rank()
+    is_block_leader = [cp.rank == 0 for cp in get_sample_cp_contexts(rollout_data)] if dynamic_cp else None
     rollout_data = restore_context_parallel_fields_to_cpu(
         rollout_data,
         all_gather_with_cp,
-        keep_restored=cp_rank == 0,
+        keep_restored=dynamic_cp or cp_rank == 0,
         allgather_cp=getattr(args, "allgather_cp", False),
     )
-    if cp_rank != 0:
+    if dynamic_cp:
+        rollout_data = _select_samples(rollout_data, is_block_leader)
+    elif cp_rank != 0:
         return
     assert rollout_data is not None
 
     rank = torch.distributed.get_rank()
     local_shard = {
         "rank": rank,
-        "data_parallel_rank": mpu.get_data_parallel_rank(with_context_parallel=False),
+        "data_parallel_rank": mpu.get_data_parallel_rank(with_context_parallel=dynamic_cp),
         "rollout_data": rollout_data,
     }
-    dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
-    dp_src_rank = mpu.get_data_parallel_src_rank(with_context_parallel=False)
+    dp_size = mpu.get_data_parallel_world_size(with_context_parallel=dynamic_cp)
+    dp_src_rank = mpu.get_data_parallel_src_rank(with_context_parallel=dynamic_cp)
     if dp_size == 1:
         dp_shards = [local_shard]
     else:
@@ -297,7 +319,7 @@ def save_debug_train_data(args, *, rollout_id, rollout_data):
             local_shard,
             dp_shards,
             dst=dp_src_rank,
-            group=mpu.get_data_parallel_group_gloo(with_context_parallel=False),
+            group=mpu.get_data_parallel_group_gloo(with_context_parallel=dynamic_cp),
         )
 
     if rank != dp_src_rank:

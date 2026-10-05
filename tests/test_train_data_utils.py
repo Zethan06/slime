@@ -241,6 +241,53 @@ def test_save_debug_train_data_without_cp_uses_same_normalized_format(tmp_path, 
         torch.testing.assert_close(sample[key], rollout_data[key][0])
 
 
+def test_save_debug_train_data_dynamic_cp_writes_each_sample_once(tmp_path, monkeypatch):
+    """Dynamic CP: a sample is replicated over its CP block, so only the block's rank 0
+    keeps it, and shards are gathered over DP x CP."""
+    from megatron.core import mpu
+    from slime.backends.megatron_utils import cp_utils
+    from slime.backends.megatron_utils.cp_utils import CPContext
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    _patch_single_dp_writer(monkeypatch, mpu, cp_size=2, writer_rank=0)
+    with_cp_flags = []
+    monkeypatch.setattr(
+        mpu,
+        "get_data_parallel_world_size",
+        lambda with_context_parallel=False: with_cp_flags.append(with_context_parallel) or 1,
+        raising=False,
+    )
+    # Samples 0 and 2 run on CP blocks where this rank is rank 0; sample 1 on a block
+    # where it is rank 1.
+    cps = [CPContext(1, 0, None), CPContext(2, 1, None), CPContext(2, 0, None)]
+    monkeypatch.setattr(cp_utils, "get_sample_cp_contexts", lambda _rollout_data: cps)
+    monkeypatch.setattr(
+        cp_utils,
+        "all_gather_with_cp",
+        lambda value, total_length, response_length, cp: torch.full((response_length,), float(total_length)),
+    )
+    args = Namespace(save_debug_train_data=str(tmp_path / "dcp_{rollout_id}_{rank}.pt"), dynamic_context_parallel=True)
+    rollout_data = {
+        "tokens": [torch.arange(4), torch.arange(5), torch.arange(6)],
+        "total_lengths": [4, 5, 6],
+        "response_lengths": [2, 3, 4],
+        "sample_indices": [0, 1, 2],
+        "log_probs": [torch.zeros(2), torch.zeros(2), torch.zeros(2)],
+        "rewards": [1.0, 0.0, 0.5],
+        "micro_batch_indices": [[0], [1, 2]],
+        "micro_batch_cp_sizes": [1, 2],
+    }
+
+    save_debug_train_data(args, rollout_id=3, rollout_data=rollout_data)
+
+    saved = torch.load(tmp_path / "dcp_3_0.pt", weights_only=True)
+    assert [sample["sample_index"] for sample in saved["samples"]] == [0, 2]
+    assert [sample["rewards"] for sample in saved["samples"]] == [1.0, 0.5]
+    assert [sample["log_probs"].tolist() for sample in saved["samples"]] == [[4.0, 4.0], [6.0] * 4]
+    assert saved["dp_shards"][0]["micro_batch_cp_sizes"] == [1, 2]
+    assert with_cp_flags == [True]
+
+
 def _layout_shard(rank, dp_rank, sample_indices, log_probs, **extra):
     return {
         "rank": rank,

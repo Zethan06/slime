@@ -44,6 +44,31 @@ def _validate_allgather_cp_supported(args, hf_config=None):
     )
 
 
+def _validate_dynamic_context_parallel(args):
+    if not getattr(args, "dynamic_context_parallel", False):
+        return
+
+    unsupported = {
+        "--allgather-cp": args.allgather_cp,
+        "--calculate-per-token-loss": args.calculate_per_token_loss,
+        "--pipeline-model-parallel-size > 1": args.pipeline_model_parallel_size > 1,
+        "--virtual-pipeline-model-parallel-size": args.virtual_pipeline_model_parallel_size is not None,
+        # These hooks slice or gather CP shards with the static CP group; under DCP each
+        # sample has its own CP group, which the hook signatures do not carry yet.
+        "--custom-tis-function-path": args.custom_tis_function_path is not None,
+        "--custom-advantage-function-path": args.custom_advantage_function_path is not None,
+        "--custom-pg-loss-reducer-function-path": args.custom_pg_loss_reducer_function_path is not None,
+    }
+    enabled = [name for name, is_set in unsupported.items() if is_set]
+    if enabled:
+        raise ValueError(f"--dynamic-context-parallel does not support {', '.join(enabled)} yet.")
+    if not args.use_dynamic_batch_size or args.max_tokens_per_gpu is None:
+        raise ValueError(
+            "--dynamic-context-parallel requires --use-dynamic-batch-size and --max-tokens-per-gpu "
+            "(the per-rank token budget of the DCP scheduler)."
+        )
+
+
 def _has_dense_moe_layers(args):
     moe_layer_freq = getattr(args, "moe_layer_freq", None)
     if moe_layer_freq is None:
@@ -77,6 +102,7 @@ def validate_args(args):
     """Run megatron's own validate_args plus slime-specific megatron validations."""
 
     _megatron_validate_args(args)
+    _validate_dynamic_context_parallel(args)
 
     # always use varlen
     args.variable_seq_lengths = True

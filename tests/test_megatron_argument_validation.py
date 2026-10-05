@@ -575,3 +575,58 @@ def test_force_fp8_ue8m0_scale_argument(monkeypatch):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+def make_dynamic_cp_args(**overrides):
+    values = dict(
+        dynamic_context_parallel=True,
+        allgather_cp=False,
+        calculate_per_token_loss=False,
+        pipeline_model_parallel_size=1,
+        virtual_pipeline_model_parallel_size=None,
+        custom_tis_function_path=None,
+        custom_advantage_function_path=None,
+        custom_pg_loss_reducer_function_path=None,
+        use_dynamic_batch_size=True,
+        max_tokens_per_gpu=4096,
+    )
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
+
+
+@pytest.mark.unit
+def test_dynamic_cp_accepts_supported_config(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+
+    module._validate_dynamic_context_parallel(make_dynamic_cp_args())
+    # Disabled DCP never inspects the rest of the config.
+    module._validate_dynamic_context_parallel(types.SimpleNamespace(dynamic_context_parallel=False))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "overrides,flag",
+    [
+        (dict(allgather_cp=True), "--allgather-cp"),
+        (dict(calculate_per_token_loss=True), "--calculate-per-token-loss"),
+        (dict(pipeline_model_parallel_size=2), "--pipeline-model-parallel-size"),
+        (dict(virtual_pipeline_model_parallel_size=2), "--virtual-pipeline-model-parallel-size"),
+        (dict(custom_tis_function_path="m.f"), "--custom-tis-function-path"),
+        (dict(custom_advantage_function_path="m.f"), "--custom-advantage-function-path"),
+        (dict(custom_pg_loss_reducer_function_path="m.f"), "--custom-pg-loss-reducer-function-path"),
+    ],
+)
+def test_dynamic_cp_rejects_unsupported_features(monkeypatch, overrides, flag):
+    module = load_arguments_module(monkeypatch)
+
+    with pytest.raises(ValueError, match=flag):
+        module._validate_dynamic_context_parallel(make_dynamic_cp_args(**overrides))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("overrides", [dict(use_dynamic_batch_size=False), dict(max_tokens_per_gpu=None)])
+def test_dynamic_cp_requires_dynamic_batch_size(monkeypatch, overrides):
+    module = load_arguments_module(monkeypatch)
+
+    with pytest.raises(ValueError, match="--max-tokens-per-gpu"):
+        module._validate_dynamic_context_parallel(make_dynamic_cp_args(**overrides))

@@ -176,6 +176,8 @@ def log_rollout_data(
             "global_batch_sizes",
             "num_microbatches",
             "micro_batch_indices",
+            "micro_batch_cp_sizes",
+            "cp_sizes",
             "source_names",
             "local_raw_reward",
         }
@@ -213,10 +215,19 @@ def log_rollout_data(
                         )
                         log_dict[key] = (sum_value, count)
                         continue
-                    per_rank_sum = tensor.mean() * cp_size * count
-                    sum_value = per_rank_sum.item()
-                else:
+                    # Token mean. Every response token lives on exactly one CP rank, so
+                    # summing local tokens and token counts over DP x CP is exact for
+                    # CP=1, static CP and dynamic CP alike.
+                    sum_value = tensor.sum().item()
+                    count = tensor.numel()
+                elif key == "raw_reward":
+                    # Shipped whole to every rank: identical on all ranks, no weighting.
                     sum_value = sum(value)
+                else:
+                    # A sample is replicated over its CP group: weight it by 1/cp_size so
+                    # it counts once (static CP: same ratio as unweighted).
+                    sum_value = sum(v / cp.size for v, cp in zip(value, cps, strict=True))
+                    count = sum(1 / cp.size for cp in cps)
                 log_dict[key] = (sum_value, count)
             elif isinstance(value, torch.Tensor):
                 log_dict[key] = (value.float().mean().item(), 1)

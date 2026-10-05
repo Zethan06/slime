@@ -323,3 +323,86 @@ def test_train_one_step_per_token_loss_report_invariant_to_cp(monkeypatch, mock_
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+# ---------------------------------------------------------------------------
+# log_rollout_data: token-level and per-sample scalar metrics must report the
+# same number under CP=1, static CP and dynamic CP (where a sample is replicated
+# over a CP block whose size differs from sample to sample).
+# ---------------------------------------------------------------------------
+
+
+def _rollout_report(monkeypatch, rank_layouts, samples):
+    """Run log_rollout_data once per simulated rank and reduce like gather_log_data.
+
+    ``rank_layouts[r]`` = list of ``(sample_id, CPContext)`` the rank holds.
+    """
+    from argparse import Namespace
+
+    from megatron.core import mpu
+
+    from slime.backends.megatron_utils import cp_utils
+    from slime.backends.megatron_utils.cp_utils import slice_log_prob_with_cp
+    from slime.observability import train_metric_utils
+
+    monkeypatch.setattr(mpu, "get_tensor_model_parallel_rank", lambda: 0, raising=False)
+    monkeypatch.setattr(mpu, "is_pipeline_last_stage", lambda **_kwargs: True, raising=False)
+    monkeypatch.setattr(mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(mpu, "get_data_parallel_world_size", lambda with_context_parallel=False: 1, raising=False)
+    captured = []
+    monkeypatch.setattr(train_metric_utils, "gather_log_data", lambda *args: captured.append(args[3]))
+    args = Namespace(ci_test=False, log_multi_turn=False, log_passrate=False, log_correct_samples=False)
+
+    for layout in rank_layouts:
+        cps = [cp for _, cp in layout]
+        monkeypatch.setattr(cp_utils, "get_sample_cp_contexts", lambda _rollout_data, cps=cps: cps)
+        rollout_data = {"response_lengths": [], "total_lengths": [], "loss_masks": [], "entropy": [], "rewards": []}
+        for sample_id, cp in layout:
+            total, response, entropy, reward = samples[sample_id]
+            rollout_data["response_lengths"].append(response)
+            rollout_data["total_lengths"].append(total)
+            rollout_data["loss_masks"].append(torch.ones(response))
+            rollout_data["entropy"].append(
+                entropy if cp.size == 1 else slice_log_prob_with_cp(entropy, total, response, cp=cp)
+            )
+            rollout_data["rewards"].append(reward)
+        rollout_data["global_batch_sizes"] = [len(samples)]
+        train_metric_utils.log_rollout_data(0, args, rollout_data)
+
+    return {
+        key: sum(log_dict[key][0] for log_dict in captured) / sum(log_dict[key][1] for log_dict in captured)
+        for key in ("entropy", "rewards")
+    }
+
+
+@pytest.mark.unit
+def test_rollout_report_token_and_scalar_metrics_invariant_to_cp_layout(monkeypatch):
+    from slime.backends.megatron_utils.cp_utils import CPContext
+
+    generator = torch.Generator().manual_seed(0)
+    samples = [
+        (total, response, torch.rand(response, generator=generator), reward)
+        for total, response, reward in [(9, 6, 1.0), (13, 10, 0.0), (7, 4, 0.5)]
+    ]
+    expected = {
+        "entropy": torch.cat([entropy for _, _, entropy, _ in samples]).mean().item(),
+        "rewards": sum(reward for *_, reward in samples) / len(samples),
+    }
+
+    def single(rank=0):
+        return CPContext(1, rank, None)
+
+    layouts = {
+        "cp1": [[(0, single()), (1, single()), (2, single())]],
+        "static_cp2": [[(i, CPContext(2, r, None)) for i in range(3)] for r in range(2)],
+        # Dynamic CP over 2 ranks: sample 1 runs on a 2-rank block, samples 0 and 2 on
+        # one rank each.
+        "dynamic_cp": [
+            [(0, single()), (1, CPContext(2, 0, None))],
+            [(2, single()), (1, CPContext(2, 1, None))],
+        ],
+    }
+    for name, rank_layouts in layouts.items():
+        reported = _rollout_report(monkeypatch, rank_layouts, samples)
+        for key, value in expected.items():
+            assert reported[key] == pytest.approx(value), f"{name}: {key}"
