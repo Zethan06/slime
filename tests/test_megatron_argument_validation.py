@@ -617,6 +617,8 @@ def test_dynamic_cp_accepts_supported_config(monkeypatch):
     module = load_arguments_module(monkeypatch)
 
     module._validate_dynamic_cp(make_dynamic_cp_args())
+    # Per-token loss normalizes by each rank's CP-chunk token count under DCP.
+    module._validate_dynamic_cp(make_dynamic_cp_args(calculate_per_token_loss=True))
     # Disabled DCP never inspects the rest of the config.
     module._validate_dynamic_cp(types.SimpleNamespace(dynamic_cp=False))
 
@@ -626,7 +628,6 @@ def test_dynamic_cp_accepts_supported_config(monkeypatch):
     "overrides,flag",
     [
         (dict(allgather_cp=True), "--allgather-cp"),
-        (dict(calculate_per_token_loss=True), "--calculate-per-token-loss"),
         (dict(pipeline_model_parallel_size=2), "--pipeline-model-parallel-size"),
         (dict(virtual_pipeline_model_parallel_size=2), "--virtual-pipeline-model-parallel-size"),
         (dict(custom_tis_function_path="m.f"), "--custom-tis-function-path"),

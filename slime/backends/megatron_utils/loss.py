@@ -33,6 +33,7 @@ from slime.utils.types import RolloutBatch
 from .cp_utils import (
     CPContext,
     all_gather_with_cp,
+    get_chunked_loss_masks,
     get_cp_context,
     get_logits_and_tokens_offset_with_cp,
     get_sample_cp_contexts,
@@ -1495,6 +1496,34 @@ def sft_loss_function(
     )
 
 
+def scale_per_token_loss(
+    args: Namespace,
+    batch: RolloutBatch,
+    loss: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(loss, num_tokens)`` for Megatron's per-token loss normalization.
+
+    ``loss`` sums the loss over the tokens in this rank's CP chunk. Megatron sums
+    the gradients over DP x CP and divides them by ``num_tokens`` all-reduced over
+    DP x CP, so both sides must add up to the step totals over the same tokens.
+    """
+    if args.dynamic_cp:
+        # The CP size differs between micro-batches, so no single factor could cancel
+        # on both sides: count only the loss tokens in this rank's CP chunk, the ones
+        # ``loss`` sums over. A chunk may hold none, so there is no per-sample clamp.
+        chunked_loss_masks = get_chunked_loss_masks(
+            batch["total_lengths"],
+            batch["response_lengths"],
+            batch["loss_masks"],
+            cps=[batch["cp"]] * len(batch["total_lengths"]),
+        )
+        return loss, sum([loss_mask.sum() for loss_mask in chunked_loss_masks])
+    # Every CP rank counts each sample's full loss mask, so the all-reduced
+    # num_tokens is CP-inflated; scale the loss by the same factor to cancel it.
+    num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
+    return loss * mpu.get_context_parallel_world_size(), num_tokens
+
+
 def loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -1529,8 +1558,6 @@ def loss_function(
         - `logging_dict` has keys "keys" (list of str metric names) and
           "values" (1D tensor: [count, metric1, metric2, ...]).
     """
-    num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
-
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],
         batch["response_lengths"],
@@ -1574,7 +1601,7 @@ def loss_function(
             * mpu.get_data_parallel_world_size(with_context_parallel=True)
         )
     else:
-        loss = loss * mpu.get_context_parallel_world_size()
+        loss, num_tokens = scale_per_token_loss(args, batch, loss)
 
     return (
         loss,

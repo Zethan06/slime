@@ -699,7 +699,9 @@ def train_one_step(
             losses_reduced,
             calculate_per_token_loss=args.calculate_per_token_loss,
             step_global_batch_size=step_global_batch_size,
-            cp_size=mpu.get_context_parallel_world_size(),
+            # Under dynamic CP each rank counts only its CP chunk's loss tokens, so the
+            # all-reduced per-token num_tokens carries no CP inflation to cancel.
+            cp_size=1 if args.dynamic_cp else mpu.get_context_parallel_world_size(),
             dp_with_cp_group=mpu.get_data_parallel_group(with_context_parallel=True),
         )
         return loss_reduced, grad_norm

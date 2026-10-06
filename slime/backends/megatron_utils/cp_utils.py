@@ -134,6 +134,29 @@ def get_logits_and_tokens_offset_with_cp(
     return chunk_size, (chunk_0, chunk_1), (logits_0, logits_1), (token_0, token_1)
 
 
+def get_chunked_loss_masks(
+    total_lengths: list[int],
+    response_lengths: list[int],
+    loss_masks: list[torch.Tensor],
+    *,
+    cps: Sequence[CPContext],
+) -> list[torch.Tensor]:
+    """Slice each sample's response loss mask to the tokens in this rank's CP chunk."""
+    chunked_loss_masks: list[torch.Tensor] = []
+    for total_length, response_length, loss_mask, cp in zip(
+        total_lengths, response_lengths, loss_masks, cps, strict=False
+    ):
+        if cp.size == 1:
+            chunked_loss_masks.append(loss_mask)
+            continue
+        prompt_length = total_length - response_length
+        _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(total_length, response_length, cp=cp)
+        loss_mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
+        loss_mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
+        chunked_loss_masks.append(torch.cat([loss_mask_0, loss_mask_1], dim=0))
+    return chunked_loss_masks
+
+
 def get_sum_of_sample_mean(
     total_lengths: list[int],
     response_lengths: list[int],
@@ -163,22 +186,8 @@ def get_sum_of_sample_mean(
     if cps is None:
         cps = [get_cp_context()] * len(total_lengths)
 
-    cp_chunk_lengths: list[int] = []
-    chunked_loss_masks: list[torch.Tensor] = []
-    for total_length, response_length, loss_mask, cp in zip(
-        total_lengths, response_lengths, loss_masks, cps, strict=False
-    ):
-        if cp.size == 1:
-            cp_chunk_lengths.append(response_length)
-            chunked_loss_masks.append(loss_mask)
-            continue
-        prompt_length = total_length - response_length
-        _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(total_length, response_length, cp=cp)
-        loss_mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
-        loss_mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
-        chunked_loss_mask = torch.cat([loss_mask_0, loss_mask_1], dim=0)
-        chunked_loss_masks.append(chunked_loss_mask)
-        cp_chunk_lengths.append(chunked_loss_mask.size(0))
+    chunked_loss_masks = get_chunked_loss_masks(total_lengths, response_lengths, loss_masks, cps=cps)
+    cp_chunk_lengths = [chunked_loss_mask.size(0) for chunked_loss_mask in chunked_loss_masks]
 
     def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
         return sum(

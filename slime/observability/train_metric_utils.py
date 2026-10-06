@@ -33,7 +33,8 @@ def reduce_train_step_metrics(
            CP-inflated by ``cp_size`` because every CP rank computes the same
            num_tokens off the FULL (not chunked) masks; the
            ``cp_factor = cp_size`` multiplier cancels that inflation, leaving
-           the genuine per-token average.
+           the genuine per-token average. Under dynamic CP each rank counts
+           only its CP chunk's tokens, so the caller passes ``cp_size=1``.
          - per-rollout-mean: divisor = constant ``step_global_batch_size`` from
            the rollout side, never all-reduced, so no CP inflation to cancel
            and ``cp_factor = 1``.

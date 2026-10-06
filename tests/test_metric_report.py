@@ -321,6 +321,68 @@ def test_train_one_step_per_token_loss_report_invariant_to_cp(monkeypatch, mock_
     assert simulate(1) == pytest.approx(simulate(2))
 
 
+@pytest.mark.unit
+def test_train_one_step_per_token_loss_report_under_dynamic_cp(mock_dp_with_cp_group):
+    """Per-token-loss report under dynamic CP: ``scale_per_token_loss`` counts only
+    the loss tokens in each rank's CP chunk, so ``values[0]`` already sums to the
+    exact token count and ``train_one_step`` passes ``cp_size=1``. A layout mixing a
+    2-rank CP block with single-rank micro-batches must report the CP=1 token mean.
+    """
+    from argparse import Namespace
+
+    from slime.backends.megatron_utils.cp_utils import CPContext, slice_log_prob_with_cp
+    from slime.backends.megatron_utils.loss import scale_per_token_loss
+
+    # (total_length, response_length, x, loss_mask). Sample 1's masked-out head
+    # leaves its rank-0 chunk of the 2-rank block without any loss token.
+    samples = [
+        (9, 6, torch.arange(1.0, 7.0), torch.tensor([1, 1, 1, 1, 0, 0], dtype=torch.int)),
+        (13, 10, torch.arange(10.0, 110.0, 10.0), torch.tensor([0, 0, 1, 1, 1, 1, 1, 1, 0, 1], dtype=torch.int)),
+        (7, 4, torch.arange(100.0, 500.0, 100.0), torch.tensor([1, 0, 1, 1], dtype=torch.int)),
+    ]
+    rank_micro_batches = [
+        [[(0, CPContext(1, 0, None))], [(1, CPContext(2, 0, None))]],
+        [[(2, CPContext(1, 0, None))], [(1, CPContext(2, 1, None))]],
+    ]
+
+    values_after_allreduce = torch.zeros(2)
+    chunk_num_tokens = []
+    for micro_batches in rank_micro_batches:
+        for micro_batch in micro_batches:
+            cp = micro_batch[0][1]
+            total_lengths = [samples[i][0] for i, _ in micro_batch]
+            response_lengths = [samples[i][1] for i, _ in micro_batch]
+            loss_masks = [samples[i][3] for i, _ in micro_batch]
+            x = torch.cat(
+                [slice_log_prob_with_cp(samples[i][2], samples[i][0], samples[i][1], cp=cp) for i, _ in micro_batch]
+            )
+            loss = get_sum_of_sample_mean(
+                total_lengths, response_lengths, loss_masks, calculate_per_token_loss=True, cps=[cp] * len(micro_batch)
+            )(x)
+            batch = {
+                "total_lengths": total_lengths,
+                "response_lengths": response_lengths,
+                "loss_masks": loss_masks,
+                "cp": cp,
+            }
+            scaled_loss, num_tokens = scale_per_token_loss(Namespace(dynamic_cp=True), batch, loss)
+            assert scaled_loss.item() == loss.item()  # no CP factor under dynamic CP
+            chunk_num_tokens.append(int(num_tokens))
+            values_after_allreduce += torch.tensor([num_tokens, loss])
+    assert 0 in chunk_num_tokens
+
+    reduced = reduce_train_step_metrics(
+        [{"keys": ["metric"], "values": values_after_allreduce}],
+        calculate_per_token_loss=True,
+        step_global_batch_size=999,  # unused in per-token-loss path
+        cp_size=1,
+        dp_with_cp_group=mock_dp_with_cp_group,
+    )
+    token_sum = sum((x * mask).sum().item() for _, _, x, mask in samples)
+    token_count = sum(mask.sum().item() for *_, mask in samples)
+    assert reduced["metric"] == pytest.approx(token_sum / token_count)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
 

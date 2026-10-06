@@ -50,7 +50,6 @@ def _validate_dynamic_cp(args):
 
     unsupported = {
         "--allgather-cp": args.allgather_cp,
-        "--calculate-per-token-loss": args.calculate_per_token_loss,
         "--pipeline-model-parallel-size > 1": args.pipeline_model_parallel_size > 1,
         "--virtual-pipeline-model-parallel-size": args.virtual_pipeline_model_parallel_size is not None,
         # User hooks may slice or gather CP shards with the static CP group; under DCP each
