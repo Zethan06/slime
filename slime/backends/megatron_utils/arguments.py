@@ -44,8 +44,8 @@ def _validate_allgather_cp_supported(args, hf_config=None):
     )
 
 
-def _validate_dynamic_context_parallel(args):
-    if not getattr(args, "dynamic_context_parallel", False):
+def _validate_dynamic_cp(args):
+    if not getattr(args, "dynamic_cp", False):
         return
 
     unsupported = {
@@ -53,11 +53,17 @@ def _validate_dynamic_context_parallel(args):
         "--calculate-per-token-loss": args.calculate_per_token_loss,
         "--pipeline-model-parallel-size > 1": args.pipeline_model_parallel_size > 1,
         "--virtual-pipeline-model-parallel-size": args.virtual_pipeline_model_parallel_size is not None,
-        # These hooks slice or gather CP shards with the static CP group; under DCP each
+        # User hooks may slice or gather CP shards with the static CP group; under DCP each
         # sample has its own CP group, which the hook signatures do not carry yet.
         "--custom-tis-function-path": args.custom_tis_function_path is not None,
         "--custom-advantage-function-path": args.custom_advantage_function_path is not None,
         "--custom-pg-loss-reducer-function-path": args.custom_pg_loss_reducer_function_path is not None,
+        "--custom-loss-function-path": args.custom_loss_function_path is not None,
+        "--rollout-data-postprocess-path": args.rollout_data_postprocess_path is not None,
+        # Megatron's own dynamic CP rejects these as well.
+        "CUDA graphs (--cuda-graph-impl)": args.cuda_graph_impl != "none",
+        "--use-megatron-fsdp": args.use_megatron_fsdp,
+        "--use-torch-fsdp2": args.use_torch_fsdp2,
         # Only TE attention switches to the per-micro-batch CP group in PackedSeqParams, and
         # only for p2p CP; MLA rejects a per-micro-batch CP size.
         "--transformer-impl other than transformer_engine": args.transformer_impl != "transformer_engine",
@@ -74,17 +80,22 @@ def _validate_dynamic_context_parallel(args):
     }
     enabled = [name for name, is_set in unsupported.items() if is_set]
     if enabled:
-        raise ValueError(f"--dynamic-context-parallel does not support {', '.join(enabled)} yet.")
+        raise ValueError(f"--dynamic-cp does not support {', '.join(enabled)} yet.")
     if not args.use_dynamic_batch_size or args.max_tokens_per_gpu is None:
         raise ValueError(
-            "--dynamic-context-parallel requires --use-dynamic-batch-size and --max-tokens-per-gpu "
+            "--dynamic-cp requires --use-dynamic-batch-size and --max-tokens-per-gpu "
             "(the per-rank token budget of the DCP scheduler)."
+        )
+    if args.balance_data or args.balance_by_flops:
+        logger.warning(
+            "--balance-data / --balance-by-flops have no effect with --dynamic-cp: the dynamic CP "
+            "scheduler balances the per-rank seq_len**2 / cp_size workload itself."
         )
     # Every micro-batch runs on an aligned power-of-2 block of the DP x CP ranks.
     dp_cp_size = args.data_parallel_size * args.context_parallel_size
     if dp_cp_size < 2 or dp_cp_size & (dp_cp_size - 1):
         raise ValueError(
-            f"--dynamic-context-parallel requires data parallel size x context parallel size to be a power "
+            f"--dynamic-cp requires data parallel size x context parallel size to be a power "
             f"of 2 >= 2, got {args.data_parallel_size} x {args.context_parallel_size}."
         )
 
@@ -122,7 +133,7 @@ def validate_args(args):
     """Run megatron's own validate_args plus slime-specific megatron validations."""
 
     _megatron_validate_args(args)
-    _validate_dynamic_context_parallel(args)
+    _validate_dynamic_cp(args)
 
     # always use varlen
     args.variable_seq_lengths = True

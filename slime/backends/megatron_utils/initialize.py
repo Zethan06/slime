@@ -1,3 +1,4 @@
+import inspect
 import logging
 import random
 
@@ -6,6 +7,7 @@ import torch
 from megatron.core import mpu, tensor_parallel
 from megatron.core.config import set_experimental_flag
 from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator
+from megatron.core.transformer.attention import Attention
 from megatron.training.global_vars import _build_tokenizer, set_args
 
 from .cp_utils import init_dynamic_cp_groups
@@ -54,9 +56,17 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
         create_gloo_process_groups=args.enable_gloo_process_groups,
         # Builds the aligned power-of-2 DP x CP groups dynamic CP micro-batches run on.
         # The TransformerConfig field of the same name stays off: slime owns the schedule.
-        hybrid_context_parallel=args.dynamic_context_parallel,
+        hybrid_context_parallel=args.dynamic_cp,
     )
-    if args.dynamic_context_parallel:
+    if args.dynamic_cp:
+        # THD RoPE must use each micro-batch's CP group (docker/patch/latest/megatron.patch);
+        # unpatched Megatron uses the static CP group and errors or gets positions wrong.
+        rope_source = inspect.getsource(Attention.forward)
+        if "packed_seq_params.cp_group" not in rope_source and "resolve_cp_group" not in rope_source:
+            raise RuntimeError(
+                "--dynamic-cp needs a Megatron whose attention applies THD RoPE with "
+                "packed_seq_params.cp_group; apply docker/patch/latest/megatron.patch."
+            )
         init_dynamic_cp_groups()
         if args.context_parallel_size == 1:
             # TE only creates its CP stream when the static CP size is > 1, but dynamic CP

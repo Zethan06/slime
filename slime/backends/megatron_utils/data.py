@@ -96,6 +96,9 @@ def get_batch(
     # Dynamic CP points TE attention and RoPE at this micro-batch's CP group. Static CP
     # leaves them unset so the model keeps its own (possibly hierarchical) CP groups.
     dynamic_cp = batch.get("cp_size") is not None
+    # A None group with local_cp_size set would make Megatron's THD RoPE fall back to the
+    # static CP group; dynamic CP registers a real group for every size, including 1.
+    assert not dynamic_cp or cp.group is not None, f"no CP group for dynamic CP size {cp.size}"
     packed_seq_params = PackedSeqParams(
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,

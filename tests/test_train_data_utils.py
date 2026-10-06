@@ -266,7 +266,7 @@ def test_save_debug_train_data_dynamic_cp_writes_each_sample_once(tmp_path, monk
         "all_gather_with_cp",
         lambda value, total_length, response_length, cp: torch.full((response_length,), float(total_length)),
     )
-    args = Namespace(save_debug_train_data=str(tmp_path / "dcp_{rollout_id}_{rank}.pt"), dynamic_context_parallel=True)
+    args = Namespace(save_debug_train_data=str(tmp_path / "dcp_{rollout_id}_{rank}.pt"), dynamic_cp=True)
     rollout_data = {
         "tokens": [torch.arange(4), torch.arange(5), torch.arange(6)],
         "total_lengths": [4, 5, 6],

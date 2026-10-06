@@ -33,7 +33,7 @@ def _server_args(**overrides):
         no_load_optim=False,
         no_load_rng=False,
         only_train_params_name_list=["actor"],
-        dynamic_context_parallel=False,
+        dynamic_cp=False,
     )
     values.update(overrides)
     return Namespace(**values)
@@ -83,10 +83,10 @@ def test_validate_megatron_server_args_rejects_invalid_server_values():
         validate_megatron_server_args(args)
 
 
-def test_validate_megatron_server_args_rejects_dynamic_context_parallel():
-    args = configure_megatron_server_args(_server_args(dynamic_context_parallel=True))
+def test_validate_megatron_server_args_rejects_dynamic_cp():
+    args = configure_megatron_server_args(_server_args(dynamic_cp=True))
 
-    with pytest.raises(ValueError, match="dynamic-context-parallel"):
+    with pytest.raises(ValueError, match="dynamic-cp"):
         validate_megatron_server_args(args)
 
 

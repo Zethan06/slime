@@ -63,7 +63,14 @@ def init_dynamic_cp_groups() -> None:
 
 def get_cp_context(size: int | None = None) -> CPContext:
     """Return the CP context for ``size`` ranks; ``None`` means the static CP group."""
-    if size is not None and _dynamic_cp_contexts:
+    if _dynamic_cp_contexts:
+        # Under dynamic CP the static CP group is never the right default: a forgotten
+        # context would slice wrongly or run a collective with the wrong peers.
+        if size is None:
+            raise RuntimeError(
+                "--dynamic-cp: every micro-batch / sample has its own CP group; pass its CPContext "
+                "(cp=... / cps=..., or cp_sizes in rollout_data) instead of the static CP group."
+            )
         return _dynamic_cp_contexts[size]
     static_size = mpu.get_context_parallel_world_size()
     if size is None or size == static_size:

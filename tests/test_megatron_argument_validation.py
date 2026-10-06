@@ -579,7 +579,7 @@ if __name__ == "__main__":
 
 def make_dynamic_cp_args(**overrides):
     values = dict(
-        dynamic_context_parallel=True,
+        dynamic_cp=True,
         allgather_cp=False,
         calculate_per_token_loss=False,
         pipeline_model_parallel_size=1,
@@ -587,6 +587,13 @@ def make_dynamic_cp_args(**overrides):
         custom_tis_function_path=None,
         custom_advantage_function_path=None,
         custom_pg_loss_reducer_function_path=None,
+        custom_loss_function_path=None,
+        rollout_data_postprocess_path=None,
+        cuda_graph_impl="none",
+        use_megatron_fsdp=False,
+        use_torch_fsdp2=False,
+        balance_data=False,
+        balance_by_flops=False,
         use_dynamic_batch_size=True,
         max_tokens_per_gpu=4096,
         transformer_impl="transformer_engine",
@@ -609,9 +616,9 @@ def make_dynamic_cp_args(**overrides):
 def test_dynamic_cp_accepts_supported_config(monkeypatch):
     module = load_arguments_module(monkeypatch)
 
-    module._validate_dynamic_context_parallel(make_dynamic_cp_args())
+    module._validate_dynamic_cp(make_dynamic_cp_args())
     # Disabled DCP never inspects the rest of the config.
-    module._validate_dynamic_context_parallel(types.SimpleNamespace(dynamic_context_parallel=False))
+    module._validate_dynamic_cp(types.SimpleNamespace(dynamic_cp=False))
 
 
 @pytest.mark.unit
@@ -635,13 +642,18 @@ def test_dynamic_cp_accepts_supported_config(monkeypatch):
         (dict(mtp_num_layers=1), "--mtp-num-layers"),
         (dict(multimodal_keys={"image": "images"}), "--multimodal-keys"),
         (dict(use_critic=True), "critic"),
+        (dict(custom_loss_function_path="m.f"), "--custom-loss-function-path"),
+        (dict(rollout_data_postprocess_path="m.f"), "--rollout-data-postprocess-path"),
+        (dict(cuda_graph_impl="local"), "CUDA graphs"),
+        (dict(use_megatron_fsdp=True), "--use-megatron-fsdp"),
+        (dict(use_torch_fsdp2=True), "--use-torch-fsdp2"),
     ],
 )
 def test_dynamic_cp_rejects_unsupported_features(monkeypatch, overrides, flag):
     module = load_arguments_module(monkeypatch)
 
     with pytest.raises(ValueError, match=flag):
-        module._validate_dynamic_context_parallel(make_dynamic_cp_args(**overrides))
+        module._validate_dynamic_cp(make_dynamic_cp_args(**overrides))
 
 
 @pytest.mark.unit
@@ -650,7 +662,7 @@ def test_dynamic_cp_requires_dynamic_batch_size(monkeypatch, overrides):
     module = load_arguments_module(monkeypatch)
 
     with pytest.raises(ValueError, match="--max-tokens-per-gpu"):
-        module._validate_dynamic_context_parallel(make_dynamic_cp_args(**overrides))
+        module._validate_dynamic_cp(make_dynamic_cp_args(**overrides))
 
 
 @pytest.mark.unit
@@ -658,9 +670,7 @@ def test_dynamic_cp_requires_dynamic_batch_size(monkeypatch, overrides):
 def test_dynamic_cp_accepts_power_of_two_dp_cp(monkeypatch, dp_size, cp_size):
     module = load_arguments_module(monkeypatch)
 
-    module._validate_dynamic_context_parallel(
-        make_dynamic_cp_args(data_parallel_size=dp_size, context_parallel_size=cp_size)
-    )
+    module._validate_dynamic_cp(make_dynamic_cp_args(data_parallel_size=dp_size, context_parallel_size=cp_size))
 
 
 @pytest.mark.unit
@@ -669,6 +679,14 @@ def test_dynamic_cp_rejects_non_power_of_two_dp_cp(monkeypatch, dp_size, cp_size
     module = load_arguments_module(monkeypatch)
 
     with pytest.raises(ValueError, match="power of 2"):
-        module._validate_dynamic_context_parallel(
-            make_dynamic_cp_args(data_parallel_size=dp_size, context_parallel_size=cp_size)
-        )
+        module._validate_dynamic_cp(make_dynamic_cp_args(data_parallel_size=dp_size, context_parallel_size=cp_size))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("overrides", [dict(balance_data=True), dict(balance_by_flops=True)])
+def test_dynamic_cp_warns_that_balance_flags_have_no_effect(monkeypatch, caplog, overrides):
+    module = load_arguments_module(monkeypatch)
+
+    with caplog.at_level("WARNING"):
+        module._validate_dynamic_cp(make_dynamic_cp_args(**overrides))
+    assert "no effect with --dynamic-cp" in caplog.text

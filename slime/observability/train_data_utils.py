@@ -286,7 +286,7 @@ def save_debug_train_data(args, *, rollout_id, rollout_data):
     # shards are gathered over DP. Dynamic CP: every DP x CP rank holds its own
     # schedule, so each sample is written by rank 0 of its own CP block and shards are
     # gathered over DP x CP.
-    dynamic_cp = getattr(args, "dynamic_context_parallel", False)
+    dynamic_cp = getattr(args, "dynamic_cp", False)
     # All CP ranks in the selected PP/TP group must enter these collectives.
     # CP=1 follows the same normalization path but all_gather_with_cp is an identity.
     cp_rank = mpu.get_context_parallel_rank()

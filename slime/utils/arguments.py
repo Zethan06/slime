@@ -309,10 +309,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
             )
-            # reset_arg: newer Megatron generates this flag from its config field.
-            reset_arg(
-                parser,
-                "--dynamic-context-parallel",
+            # Not named --dynamic-context-parallel: newer Megatron owns that flag and,
+            # when it is set, validates for and schedules its own dynamic CP.
+            parser.add_argument(
+                "--dynamic-cp",
                 action="store_true",
                 default=False,
                 help=(

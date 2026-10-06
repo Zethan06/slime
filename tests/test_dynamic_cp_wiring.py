@@ -15,6 +15,7 @@ from __future__ import annotations
 import importlib
 import sys
 import types
+from collections import Counter
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -144,8 +145,9 @@ def test_dynamic_cp_context_lookup(monkeypatch, static_cp, world_rank):
         cp = get_cp_context(size)
         assert cp == CPContext(size=size, rank=world_rank % size, group=group)
         assert get_cp_context(size) is cp
-    # `None` still means the static CP group.
-    assert get_cp_context() == CPContext(size=2, rank=world_rank % 2, group=static_group)
+    # Under dynamic CP the static CP group is never an implicit default.
+    with pytest.raises(RuntimeError, match="--dynamic-cp"):
+        get_cp_context()
     with pytest.raises(KeyError):
         get_cp_context(16)
 
@@ -322,17 +324,28 @@ def test_process_rollout_data_derives_per_sample_cp_sizes(monkeypatch):
     monkeypatch.setattr(ray, "get", lambda ref: ref)
     builder = _builder(monkeypatch, dp_size=2, cp_size=2)
     refs = builder.split_by_dp(_rollout_batch())
+    per_rank = [process_rollout_data(refs, rank, 4) for rank in range(4)]
 
-    for rank in range(4):
-        rollout_data = process_rollout_data(refs, rank, 4)
-        expected = []
-        for indices, cp_size in zip(
-            rollout_data["micro_batch_indices"], rollout_data["micro_batch_cp_sizes"], strict=True
-        ):
-            expected += [cp_size] * len(indices)
-        assert rollout_data["cp_sizes"] == expected
+    # A sample runs on a block of k ranks, so it is held by exactly k ranks, each
+    # recording that k.
+    holders = Counter(sample for rollout_data in per_rank for sample in rollout_data["partition"])
+    for rollout_data in per_rank:
         assert len(rollout_data["cp_sizes"]) == len(rollout_data["response_lengths"])
+        assert rollout_data["cp_sizes"] == [holders[sample] for sample in rollout_data["partition"]]
         assert rollout_data["total_lengths"] == [len(t) for t in rollout_data["tokens"]]
+
+
+@pytest.mark.unit
+def test_process_rollout_data_cp_sizes_follow_sample_indices(monkeypatch):
+    monkeypatch.setattr(ray, "get", lambda ref: ref)
+    payload = {
+        "partition": [0, 1, 2],
+        "total_lengths": [3, 4, 5],
+        "micro_batch_indices": [[1], [0, 2]],
+        "micro_batch_cp_sizes": [4, 2],
+    }
+
+    assert process_rollout_data([SimpleNamespace(inner=payload)], 0, 1)["cp_sizes"] == [2, 4, 2]
 
 
 @pytest.mark.unit

@@ -126,9 +126,9 @@ def validate_megatron_server_args(args):
         raise ValueError("Megatron server requires debug_train_only=True.")
     if args.use_kl_loss or args.use_opd or args.use_critic:
         raise ValueError("Megatron server only supports teacher logprob prefill mode.")
-    if args.dynamic_context_parallel:
+    if args.dynamic_cp:
         # Results are returned from static CP rank 0, which under dynamic CP does not
         # hold every sample.
-        raise ValueError("Megatron server does not support --dynamic-context-parallel.")
+        raise ValueError("Megatron server does not support --dynamic-cp.")
 
     return args

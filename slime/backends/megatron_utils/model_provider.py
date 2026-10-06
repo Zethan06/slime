@@ -136,10 +136,6 @@ def _get_model_provider_func(
         # Preserve that contract for custom specs, while freeze_model_params()
         # below provides the concrete implementation on current Megatron.
         config.freeze_indexer = getattr(args, "freeze_indexer", False)
-        # slime schedules dynamic CP itself (slime.utils.dp_schedule); Megatron
-        # builds that enable this config field would take over the schedule.
-        if hasattr(config, "dynamic_context_parallel"):
-            config.dynamic_context_parallel = False
 
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)

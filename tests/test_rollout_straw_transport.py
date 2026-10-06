@@ -370,7 +370,7 @@ def test_train_partitions_preserve_top_p_and_multimodal(args, monkeypatch, trans
     manager = object.__new__(rollout.BatchBuilder)
     manager.args = SimpleNamespace(**vars(args), global_batch_size=2)
     manager.rollout_id = 0
-    manager.train_parallel_config = {"dp_size": 2, "dynamic_cp": False}
+    manager.train_parallel_config = {"dp_size": 2}
     monkeypatch.setattr(rollout, "build_dp_schedule", lambda *a, **kw: ([[1], [0]], [[[0]], [[0]]], [1], [2]))
     sent = []
 
@@ -448,7 +448,7 @@ def test_durable_batch_replays_one_plan_and_rejects_mixed_ranks(args, monkeypatc
     monkeypatch.setattr(module, "build_dp_schedule", lambda *a, **kw: ([[0], [1]], [[[0]], [[0]]], [1], [2]))
     try:
         builder = module.BatchBuilder(args, controller=handle)
-        builder.train_parallel_config = {"dp_size": 2, "dynamic_cp": False}
+        builder.train_parallel_config = {"dp_size": 2}
         builder.raw_ref = accept_raw_rollout(RolloutFnTrainOutput(samples=samples), args, 0, controller=handle)
         assert builder.begin(samples) is None
         plan = controller.batch(builder.batch_id)
@@ -713,7 +713,7 @@ def test_debug_archive_replay_reuses_records_and_isolates_training(
                 manager.args, manager.controller = replay_args, handle
                 builder = manager.batch_builder = BatchBuilder(replay_args, controller=handle)
                 builder.train_parallel_config = dict(
-                    dp_size=1, cp_size=1, vpp_size=1, microbatch_group_size_per_vp_stage=1, dynamic_cp=False
+                    dp_size=1, cp_size=1, vpp_size=1, microbatch_group_size_per_vp_stage=1
                 )
                 for step in (7, 8):
                     builder.rollout_id = step

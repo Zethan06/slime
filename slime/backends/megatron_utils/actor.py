@@ -120,8 +120,11 @@ class MegatronTrainRayActor(TrainRayActor):
             "cp_size": mpu.get_context_parallel_world_size(),
             "vpp_size": vpp_size,
             "microbatch_group_size_per_vp_stage": microbatch_group_size_per_vp_stage,
-            "dynamic_cp": args.dynamic_context_parallel,
         }
+        if args.dynamic_cp:
+            # Only set when on: this dict is hashed into the straw plan digest, which must
+            # stay unchanged for existing non-DCP runs.
+            self.train_parallel_config["dynamic_cp"] = True
 
         start_rollout_id = loaded_rollout_id + 1
 
@@ -229,7 +232,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # Fetch data through ray on CPU, not sure if this will be performance bottleneck.
         # Both first pp stage and the last pp stage will receive the data.
         # Under dynamic CP every DP x CP rank has its own payload.
-        dynamic_cp = self.args.dynamic_context_parallel
+        dynamic_cp = self.args.dynamic_cp
         rollout_data = process_rollout_data(
             rollout_data_ref,
             mpu.get_data_parallel_rank(with_context_parallel=dynamic_cp),

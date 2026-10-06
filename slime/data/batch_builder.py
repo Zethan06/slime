@@ -433,7 +433,7 @@ class BatchBuilder:
         data["total_lengths"] = total_lengths
 
         schedule_kwargs = dict(global_batch_size=self.args.global_batch_size, rollout_indices=data["rollout_ids"])
-        if self.train_parallel_config["dynamic_cp"]:
+        if self.train_parallel_config.get("dynamic_cp", False):
             # One payload per DP x CP rank; `micro_batch_cp_sizes[r][j]` is the CP size of
             # rank r's j-th micro-batch.
             partitions, micro_batch_indices, micro_batch_cp_sizes, num_microbatches, global_batch_sizes = (
