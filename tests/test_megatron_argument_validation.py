@@ -602,6 +602,8 @@ def make_dynamic_cp_args(**overrides):
         spec=None,
         custom_model_provider_path=None,
         num_experts=None,
+        moe_router_load_balancing_type="aux_loss",
+        overlap_moe_expert_parallel_comm=False,
         mtp_num_layers=None,
         multimodal_keys=None,
         use_critic=False,
@@ -619,6 +621,13 @@ def test_dynamic_cp_accepts_supported_config(monkeypatch):
     module._validate_dynamic_cp(make_dynamic_cp_args())
     # Per-token loss normalizes by each rank's CP-chunk token count under DCP.
     module._validate_dynamic_cp(make_dynamic_cp_args(calculate_per_token_loss=True))
+    # MoE routers reduce over each micro-batch's TP x CP group and skip its padding.
+    for load_balancing_type in ["aux_loss", "seq_aux_loss", "none", ["aux_loss", "seq_aux_loss"]]:
+        module._validate_dynamic_cp(
+            make_dynamic_cp_args(num_experts=8, moe_router_load_balancing_type=load_balancing_type)
+        )
+    # global_aux_loss is only rejected for MoE models.
+    module._validate_dynamic_cp(make_dynamic_cp_args(moe_router_load_balancing_type="global_aux_loss"))
     # Disabled DCP never inspects the rest of the config.
     module._validate_dynamic_cp(types.SimpleNamespace(dynamic_cp=False))
 
@@ -639,7 +648,9 @@ def test_dynamic_cp_accepts_supported_config(monkeypatch):
         (dict(multi_latent_attention=True), "--multi-latent-attention"),
         (dict(spec=["slime_plugins.models.qwen3_next", "get_qwen3_next_spec"]), "--spec"),
         (dict(custom_model_provider_path="m.f"), "--custom-model-provider-path"),
-        (dict(num_experts=8), "--num-experts"),
+        (dict(num_experts=8, moe_router_load_balancing_type="global_aux_loss"), "global_aux_loss"),
+        (dict(num_experts=8, moe_router_load_balancing_type=["aux_loss", "global_aux_loss"]), "global_aux_loss"),
+        (dict(num_experts=8, overlap_moe_expert_parallel_comm=True), "--overlap-moe-expert-parallel-comm"),
         (dict(mtp_num_layers=1), "--mtp-num-layers"),
         (dict(multimodal_keys={"image": "images"}), "--multimodal-keys"),
         (dict(use_critic=True), "critic"),

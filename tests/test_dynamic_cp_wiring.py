@@ -165,6 +165,19 @@ def test_dynamic_cp_with_static_cp_one_uses_singleton_group(monkeypatch, static_
 
 
 @pytest.mark.unit
+def test_dynamic_cp_moe_with_tp_one_reduces_routers_over_the_cp_group(monkeypatch, static_cp):
+    """With TP = 1 the MoE routers' TP x CP group of a micro-batch is its CP group."""
+    created, static_group, hybrid, dp_cp_group = _fake_dist_and_mpu(
+        monkeypatch, world_rank=5, dp_cp_size=8, static_cp_size=2
+    )
+    monkeypatch.setattr(cp_utils.mpu, "get_tensor_model_parallel_world_size", lambda: 1, raising=False)
+    cp_utils.init_dynamic_cp_groups(with_tp_cp_groups=True)
+
+    for size, group in {1: created[5], 2: static_group, 4: hybrid[4], 8: dp_cp_group}.items():
+        assert get_cp_context(size) == CPContext(size=size, rank=5 % size, group=group, tp_cp_group=group)
+
+
+@pytest.mark.unit
 def test_static_cp_rejects_other_sizes(static_cp):
     static_cp(2, 1)
     assert get_cp_context(2) == get_cp_context()
@@ -241,6 +254,42 @@ def test_get_batch_dynamic_cp_passes_microbatch_group(data_module, static_cp, st
         ]
         assert params.cu_seqlens_q.tolist() == [0] + torch.tensor(padded_lengths).cumsum(0).tolist()
         assert batch["full_loss_masks"].shape == batch["tokens"].shape
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cp_rank", [0, 1, 3])
+def test_get_batch_dynamic_cp_router_padding_mask(data_module, static_cp, cp_rank):
+    """The MoE router padding mask is True exactly at the zigzag and tail padding of the
+    rank's tokens (get_batch pads with token id 0; the real token ids are >= 1)."""
+    static_cp(1, 0)
+    cp_utils._dynamic_cp_contexts.update(
+        {size: CPContext(size=size, rank=cp_rank % size, group=_Group(range(size), str(size))) for size in (1, 2, 4)}
+    )
+    total_lengths, response_lengths = [13, 6, 1], [5, 2, 1]
+    rollout_data = _get_batch_inputs(total_lengths, response_lengths)
+    iterator = data_module.DataIterator(rollout_data, [[0, 1, 2]] * 3, micro_batch_cp_sizes=[4, 2, 1])
+    keys = ["tokens", "loss_masks", "total_lengths", "response_lengths"]
+
+    for size in (4, 2, 1):
+        batch = data_module.get_batch(iterator, keys, pad_multiplier=8)
+        padding_mask = batch["padding_mask"]
+        assert padding_mask.dtype == torch.bool and padding_mask.shape == batch["tokens"].shape
+        assert torch.equal(padding_mask, batch["tokens"] == 0)
+        # Every real token is on exactly one rank of the block; padding fills the rest.
+        expected_valid = sum(
+            int((slice_with_cp(t, 0, cp=get_cp_context(size)) != 0).sum()) for t in rollout_data["tokens"]
+        )
+        assert int((~padding_mask).sum()) == expected_valid
+        assert padding_mask.shape[1] % 8 == 0 and padding_mask[0, -1]
+
+
+@pytest.mark.unit
+def test_get_batch_static_cp_has_no_router_padding_mask(data_module, static_cp):
+    static_cp(2, 0)
+    iterator = data_module.DataIterator(_get_batch_inputs([10], [4]), [[0]])
+
+    batch = data_module.get_batch(iterator, ["tokens", "loss_masks", "total_lengths", "response_lengths"])
+    assert "padding_mask" not in batch
 
 
 def _builder(monkeypatch, *, dp_size, cp_size, transport="object-store"):

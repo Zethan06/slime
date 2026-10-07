@@ -36,6 +36,8 @@ def get_batch(
     - "unconcat_tokens": list[torch.LongTensor] for the micro-batch before CP slicing/concat
     - "packed_seq_params": PackedSeqParams with T-H-D settings (cu_seqlens on CUDA, dtype=int)
     - "cp": the CPContext this micro-batch is split over
+    - "padding_mask": dynamic CP only, torch.BoolTensor of shape [1, T_padded], True at the
+      padding positions of "tokens" (the MoE router padding mask)
     Plus any other requested keys forwarded from the iterator.
     """
 
@@ -52,6 +54,7 @@ def get_batch(
 
     cp = get_cp_context(batch.get("cp_size"))
     batch["cp"] = cp
+    dynamic_cp = batch.get("cp_size") is not None
 
     if allgather_cp:
         cp_size = mpu.get_context_parallel_world_size()
@@ -75,6 +78,11 @@ def get_batch(
         cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int, device=accelerator.current_device())
         tokens = tokens.chunk(cp_size, dim=0)[cp_rank]
     else:
+        if dynamic_cp:
+            # Every sample is zigzag-padded to a multiple of 2 * cp.size and the stream to
+            # pad_size: often a large share of a rank's tokens under dynamic CP, which the
+            # MoE routers must leave out of their load-balancing statistics.
+            padding_mask = torch.cat([slice_with_cp(torch.zeros_like(t), 1, cp=cp) for t in tokens])
         tokens = [slice_with_cp(t, pad_token_id, cp=cp) for t in tokens]
 
         cu_seqlens = [0]
@@ -88,6 +96,8 @@ def get_batch(
         if pad != 0:
             tokens = F.pad(tokens, (0, pad), value=pad_token_id)
             cu_seqlens.append(cu_seqlens[-1] + pad)
+        if dynamic_cp:
+            batch["padding_mask"] = F.pad(padding_mask, (0, pad), value=1).bool().unsqueeze(0)
 
         # thd requires the cu_seqlens to be of the origin length
         cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int, device=accelerator.device()) * cp.size
@@ -95,7 +105,6 @@ def get_batch(
     max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
     # Dynamic CP points TE attention and RoPE at this micro-batch's CP group. Static CP
     # leaves them unset so the model keeps its own (possibly hierarchical) CP groups.
-    dynamic_cp = batch.get("cp_size") is not None
     # A None group with local_cp_size set would make Megatron's THD RoPE fall back to the
     # static CP group; dynamic CP registers a real group for every size, including 1.
     assert not dynamic_cp or cp.group is not None, f"no CP group for dynamic CP size {cp.size}"

@@ -22,19 +22,47 @@ class CPContext:
     # None for static CP size 1: no CP collective is needed. Dynamic CP always
     # carries a real group, which the model reads from PackedSeqParams.
     group: ProcessGroup | None
+    # Dynamic CP with MoE only: the TP x CP group holding the micro-batch's tokens,
+    # which the MoE routers reduce their load-balancing statistics over.
+    tp_cp_group: ProcessGroup | None = None
 
 
 # Dynamic CP contexts by size, registered by `init_dynamic_cp_groups`.
 _dynamic_cp_contexts: dict[int, CPContext] = {}
 
 
-def init_dynamic_cp_groups() -> None:
+def _new_tp_cp_groups(cp_groups: dict[int, ProcessGroup]) -> dict[int, ProcessGroup]:
+    """Create, for every CP size, the union of the TP groups of the size's CP group members."""
+    tp_ranks = dist.get_process_group_ranks(mpu.get_tensor_model_parallel_group())
+    cp_ranks = {size: dist.get_process_group_ranks(group) for size, group in cp_groups.items()}
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, (tp_ranks, cp_ranks))
+    tp_ranks_of = [rank_tp_ranks for rank_tp_ranks, _ in gathered]
+
+    tp_cp_groups = {}
+    for size in sorted(cp_groups):
+        # Every rank creates every block in the same order: new_group is collective.
+        blocks = sorted(
+            {
+                tuple(sorted(r for member in rank_cp_ranks[size] for r in tp_ranks_of[member]))
+                for _, rank_cp_ranks in gathered
+            }
+        )
+        for block in blocks:
+            group = dist.new_group(list(block))
+            if dist.get_rank() in block:
+                tp_cp_groups[size] = group
+    return tp_cp_groups
+
+
+def init_dynamic_cp_groups(with_tp_cp_groups: bool = False) -> None:
     """Register the CP group of every size a dynamic CP micro-batch can run on.
 
     Collective over all ranks; call after ``mpu.initialize_model_parallel(...,
     hybrid_context_parallel=True)``. A size-k group is the aligned block of k
     consecutive DP x CP ranks holding this rank, matching the blocks built by
-    ``slime.utils.dp_schedule.build_dynamic_cp_schedule``.
+    ``slime.utils.dp_schedule.build_dynamic_cp_schedule``. ``with_tp_cp_groups``
+    (MoE) also registers the matching TP x CP groups.
     """
     dp_cp_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
     static_size = mpu.get_context_parallel_world_size()
@@ -56,9 +84,15 @@ def init_dynamic_cp_groups() -> None:
         assert dist.get_process_group_ranks(static_group) == dist.get_process_group_ranks(groups[static_size])
         groups[static_size] = static_group
 
+    tp_cp_groups = {}
+    if with_tp_cp_groups:
+        tp_cp_groups = _new_tp_cp_groups(groups) if mpu.get_tensor_model_parallel_world_size() > 1 else groups
+
     _dynamic_cp_contexts.clear()
     for size, group in groups.items():
-        _dynamic_cp_contexts[size] = CPContext(size=size, rank=dist.get_rank(group), group=group)
+        _dynamic_cp_contexts[size] = CPContext(
+            size=size, rank=dist.get_rank(group), group=group, tp_cp_group=tp_cp_groups.get(size)
+        )
 
 
 def get_cp_context(size: int | None = None) -> CPContext:

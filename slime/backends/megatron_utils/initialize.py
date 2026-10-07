@@ -8,6 +8,7 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core.config import set_experimental_flag
 from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator
 from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.moe.router import TopKRouter
 from megatron.training.global_vars import _build_tokenizer, set_args
 
 from .cp_utils import init_dynamic_cp_groups
@@ -67,7 +68,12 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
                 "--dynamic-cp needs a Megatron whose attention applies THD RoPE with "
                 "packed_seq_params.cp_group; apply docker/patch/latest/megatron.patch."
             )
-        init_dynamic_cp_groups()
+        if args.num_experts:
+            # The MoE routers must leave the padding of the micro-batch's CP layout out of
+            # their load-balancing statistics (moe_utils / get_batch).
+            if "padding_mask" not in inspect.signature(TopKRouter.routing).parameters:
+                raise RuntimeError("--dynamic-cp with MoE needs a Megatron whose MoE router takes a padding_mask.")
+        init_dynamic_cp_groups(with_tp_cp_groups=bool(args.num_experts))
         if args.context_parallel_size == 1:
             # TE only creates its CP stream when the static CP size is > 1, but dynamic CP
             # micro-batches still run p2p CP attention.

@@ -48,6 +48,9 @@ def _validate_dynamic_cp(args):
     if not getattr(args, "dynamic_cp", False):
         return
 
+    load_balancing_types = args.moe_router_load_balancing_type
+    if isinstance(load_balancing_types, str):
+        load_balancing_types = [load_balancing_types]
     unsupported = {
         "--allgather-cp": args.allgather_cp,
         "--pipeline-model-parallel-size > 1": args.pipeline_model_parallel_size > 1,
@@ -72,7 +75,12 @@ def _validate_dynamic_cp(args):
         # read the static CP group (hf_attention, qwen3_5_vl, glm5) or ignore CP.
         "--spec": args.spec is not None,
         "--custom-model-provider-path": args.custom_model_provider_path is not None,
-        "--num-experts (MoE)": bool(args.num_experts),
+        # The global aux loss averages statistics over each round's micro-batches, whose
+        # number varies per round under DCP; Megatron's scaling of it has no DCP equivalent.
+        "--moe-router-load-balancing-type global_aux_loss": bool(args.num_experts)
+        and "global_aux_loss" in load_balancing_types,
+        # The combined 1F1B schedule plan does not take the MoE router padding mask.
+        "--overlap-moe-expert-parallel-comm": args.overlap_moe_expert_parallel_comm,
         "--mtp-num-layers": bool(args.mtp_num_layers),
         "--multimodal-keys": args.multimodal_keys is not None,
         "critic (--advantage-estimator ppo)": args.use_critic,

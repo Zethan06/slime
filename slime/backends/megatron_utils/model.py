@@ -35,6 +35,7 @@ from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
 from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_rollout_top_p_logprob_kwargs, loss_function
 from .model_provider import get_model_provider_func
+from .moe_utils import get_moe_aux_loss_step_scale, set_routers_for_dynamic_cp, with_moe_aux_loss_scale
 from .stateless_adam import StatelessAdam
 
 logger = logging.getLogger(__name__)
@@ -561,6 +562,21 @@ def train_one_step(
         custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)
         custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
+    # Dynamic CP runs each micro-batch on its own TP x CP group, which Megatron's MoE
+    # routers and aux-loss scale do not know about (see moe_utils).
+    dynamic_cp_moe = args.dynamic_cp and args.num_experts
+    if dynamic_cp_moe:
+        config = get_model_config(model[0])
+        loss_scale = torch.ones(1, device=torch.cuda.current_device())
+        if config.grad_scale_func is not None:
+            loss_scale = config.grad_scale_func(loss_scale)
+        iterator = data_iterator[0]
+        moe_aux_loss_step_scale = get_moe_aux_loss_step_scale(
+            args,
+            loss_scale,
+            iterator.micro_batch_cp_sizes[iterator.offset : iterator.offset + num_microbatches],
+        )
+
     def forward_step(data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False) -> tuple[
         torch.Tensor,
         Callable[[torch.Tensor], tuple[torch.Tensor, int, dict[str, torch.Tensor | list[str]]]],
@@ -613,6 +629,9 @@ def train_one_step(
             old_stage = os.environ["ROUTING_REPLAY_STAGE"]
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
 
+        if dynamic_cp_moe:
+            set_routers_for_dynamic_cp(model, batch["cp"])
+
         if return_schedule_plan:
             assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"
             position_ids = None
@@ -640,12 +659,18 @@ def train_one_step(
             if args.enable_mtp_training:
                 forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
 
+            if dynamic_cp_moe:
+                forward_kwargs["padding_mask"] = batch["padding_mask"]
+
             output_tensor = model(**forward_kwargs)
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
-        return output_tensor, partial(loss_function, args, batch, num_microbatches, step_global_batch_size)
+        loss_func = partial(loss_function, args, batch, num_microbatches, step_global_batch_size)
+        if dynamic_cp_moe:
+            loss_func = with_moe_aux_loss_scale(loss_func, args, batch, moe_aux_loss_step_scale)
+        return output_tensor, loss_func
 
     # Forward pass.
     forward_backward_func = get_forward_backward_func()
